@@ -22,6 +22,8 @@ A virtual ham radio interface simulating the Yaesu FT-1000MP Mark-V transceiver.
   - **APF** - 5 audio peak filters (mutually exclusive)
   - **NR** - 5 noise reduction levels plus OFF (mutually exclusive)
   - **CONTOUR** - Cycling audio shaping (OFF → Low-Cut → Mid-Cut → High-Cut)
+- **Interactive Knobs** - SHIFT, WIDTH and NOTCH controls with visual indicators
+- **Power Level Control** - Adjustable transmit power level (0-100)
 
 ### Display Elements
 - **Dual Frequency Displays** - Large amber displays for both VFOs
@@ -48,6 +50,86 @@ A virtual ham radio interface simulating the Yaesu FT-1000MP Mark-V transceiver.
 ### Setup
 
 1. Clone the repository:
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. Run the application:
+   ```bash
+   python 1k_monitor_v2.py
+   ```
+
+## Configuration
+
+The application can be configured by editing the constants at the top of `1k_monitor_v2.py`:
+
+- **SERIAL_PORT** - Set to your radio's serial port (auto-detected if not specified)
+- **BAUD_RATE** - Baud rate for communication with the radio
+- **MOCK_MODE** - Set to False to use real radio mode
+
+## Usage
+
+### VFO Controls
+- Click and drag on VFO knobs to tune frequencies between 1.8-30 MHz
+- Use numeric keypad to enter frequency directly:
+  - Enter digits (e.g., 1432 for 14.320 MHz)
+  - CLR to clear entry
+  - ENT to set frequency
+
+### Mode Selection
+Select operating mode using the buttons on the left side of the display:
+- LSB, USB, CW, AM, FM
+
+### Filter Matrix Controls
+The EDSP filter matrix provides advanced audio processing:
+- **APF** (Audio Peak Filters) - 5 filters at different frequencies (250Hz to 2000Hz)
+- **NR** (Noise Reduction) - 5 levels plus OFF option 
+- **CONTOUR** - Audio shaping with 4 modes: OFF, Low-Cut, Mid-Cut, High-Cut
+
+### Control Knobs
+Interactive knobs for fine-tuning:
+- SHIFT - Adjust IF shift (-100 to +100)
+- WIDTH - Adjust filter width (-100 to +100) 
+- NOTCH - Adjust notch filter (-100 to +100)
+
+### Power Controls
+Adjust transmit power level from 0-100% using the POWER slider.
+
+## Features
+
+### Functional Controls
+- **Dual VFO (A/B)** - Independent frequency control for two VFOs
+- **VFO Knobs** - Click and drag to tune frequencies (1.8-30 MHz)
+- **Numeric Keypad** - Direct frequency entry
+  - Enter frequency digits (e.g., 1432 for 14.320 MHz)
+  - CLR to clear entry
+  - ENT to set frequency
+- **Mode Selection** - LSB, USB, CW, AM, FM
+- **A/B Switch** - Toggle between VFO A and VFO B
+- **AF/RF Gain Controls** - Adjustable audio and RF gain (0-100)
+- **Antenna Selection** - Switch between ANT 1 and ANT 2
+- **Tuner Control** - Toggle antenna tuner on/off
+- **EDSP Filter Matrix** - Enhanced DSP filtering controls
+  - **APF** - 5 audio peak filters (mutually exclusive)
+  - **NR** - 5 noise reduction levels plus OFF (mutually exclusive)
+  - **CONTOUR** - Cycling audio shaping (OFF → Low-Cut → Mid-Cut → High-Cut)
+- **Interactive Knobs** - SHIFT, WIDTH and NOTCH controls with visual indicators
+- **Power Level Control** - Adjustable transmit power level (0-100)
+
+### Display Elements
+- **Dual Frequency Displays** - Large amber displays for both VFOs
+- **S-Meter / Power Meter** - 30-segment bar graph with color gradient
+- **Mode Indicators** - Green LED indicators for active mode
+- **VFO Indicators** - Visual feedback showing active VFO
+- **Rotating Knob Indicators** - Animated dimples on VFO knobs
+- **Connection Status** - Bottom status bar with LED indicator
+  - **Orange LED** - Simulation mode
+  - **Green LED** - Connected to radio
+  - **Red LED** - Disconnected
+
+### Modes
+- **Mock Mode** (default) - Simulated radio with animated display
+- **Real Radio Mode** - Connect to actual FT-1000MP via serial port
 ```bash
 git clone https://github.com/YOUR_USERNAME/1k_monitor_v2.git
 cd 1k_monitor_v2
