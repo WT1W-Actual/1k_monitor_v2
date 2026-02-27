@@ -5,6 +5,13 @@ import threading
 import time
 import math
 import random
+import json
+import os
+from pathlib import Path
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse
+from colors import *
+from constants import *
 
 # --- CONFIGURATION ---
 # SERIAL_PORT = 'COM3'  # Windows example
@@ -35,60 +42,378 @@ def probe_radio(port_name, baud_rate):
             return False
             
     except Exception as e:
+        # Log the exception but don't crash
+        print(f"Error probing radio on {port_name} at {baud_rate}: {e}")
         return False
 
 def autodetect_serial_port():
     """Auto-detect the FT-1000MP serial port and baud rate by probing"""
-    ports = serial.tools.list_ports.comports()
-    
-    # Look for USB serial adapters
-    usb_ports = []
-    for port in ports:
-        # Common USB serial adapter patterns
-        if any(keyword in port.description.lower() for keyword in ['usb', 'serial', 'uart', 'cp210', 'ft232', 'ch340']):
-            usb_ports.append(port.device)
-            print(f"Found USB serial port: {port.device} - {port.description}")
-    
-    if not usb_ports:
-        print("No USB serial ports found. Using default from config.")
+    try:
+        ports = serial.tools.list_ports.comports()
+        
+        # Look for USB serial adapters
+        usb_ports = []
+        for port in ports:
+            # Common USB serial adapter patterns
+            if any(keyword in port.description.lower() for keyword in ['usb', 'serial', 'uart', 'cp210', 'ft232', 'ch340']):
+                usb_ports.append(port.device)
+                print(f"Found USB serial port: {port.device} - {port.description}")
+        
+        if not usb_ports:
+            print("No USB serial ports found. Using default from config.")
+            return SERIAL_PORT, BAUD_RATE
+        
+        # Probe each port at each baud rate to find the radio
+        print(f"\nProbing {len(usb_ports)} port(s) for FT-1000MP...")
+        for port in usb_ports:
+            print(f"Testing {port}...")
+            for baud in BAUD_RATES_TO_TRY:
+                if probe_radio(port, baud):
+                    print(f"✓ FT-1000MP found on {port} at {baud} baud\n")
+                    return port, baud
+            print(f"  No response at any baud rate")
+        
+        # No radio found, use first port with default baud
+        print(f"No radio detected. Using first available port: {usb_ports[0]} at {BAUD_RATE} baud\n")
+        return usb_ports[0] if usb_ports else SERIAL_PORT, BAUD_RATE
+        
+    except Exception as e:
+        print(f"Error during serial port autodetection: {e}")
+        # Return default values on error
         return SERIAL_PORT, BAUD_RATE
-    
-    # Probe each port at each baud rate to find the radio
-    print(f"\nProbing {len(usb_ports)} port(s) for FT-1000MP...")
-    for port in usb_ports:
-        print(f"Testing {port}...")
-        for baud in BAUD_RATES_TO_TRY:
-            if probe_radio(port, baud):
-                print(f"✓ FT-1000MP found on {port} at {baud} baud\n")
-                return port, baud
-        print(f"  No response at any baud rate")
-    
-    # No radio found, use first port with default baud
-    print(f"No radio detected. Using first available port: {usb_ports[0]} at {BAUD_RATE} baud\n")
-    return usb_ports[0] if usb_ports else SERIAL_PORT, BAUD_RATE
 
-# --- COLORS (FT-1000MP Palette) ---
-COLOR_CHASSIS = "#2b2b2b"
-COLOR_BEZEL = "#1a1a1a"
-COLOR_DISPLAY_BG = "#000000"
-COLOR_DISPLAY_OFF = "#221100"  # Dim amber
-COLOR_DISPLAY_ON = "#ff9900"   # Bright amber (Yaesu style)
-COLOR_DISPLAY_RED = "#ff3333"  # TX color
-COLOR_KNOB_MAIN = "#151515"
-COLOR_KNOB_RING = "#333333"
-COLOR_TEXT_LABEL = "#aaaaaa"
-COLOR_LED_GREEN = "#00ff00"
-COLOR_LED_OFF = "#113311"
+# --- HTTP API SERVER ---
+class RadioAPIHandler(BaseHTTPRequestHandler):
+    """HTTP API request handler for remote radio control"""
+    
+    radio_app = None  # Will be set to the HamSimulatorApp instance
+    
+    def log_message(self, format, *args):
+        """Override to suppress default logging (optional)"""
+        pass  # Comment this out to enable request logging
+    
+    def _set_headers(self, status=200, content_type='application/json'):
+        """Set HTTP response headers with CORS support"""
+        self.send_response(status)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Access-Control-Allow-Origin', '*')  # CORS
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
+    
+    def _send_json(self, data, status=200):
+        """Send JSON response"""
+        self._set_headers(status)
+        self.wfile.write(json.dumps(data).encode())
+    
+    def _send_error_json(self, message, status=400):
+        """Send error response"""
+        self._send_json({'error': message, 'success': False}, status)
+
+    def _parse_bool(self, value):
+        """Parse booleans from JSON values and common string forms."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+        raise ValueError("Boolean value expected")
+
+    def _normalize_frequency(self, value):
+        """Normalize frequency to XX.XXX.XX-style string and validate ham range."""
+        if isinstance(value, (int, float)):
+            freq_mhz = float(value)
+        elif isinstance(value, str):
+            digits = "".join(ch for ch in value if ch.isdigit())
+            if not digits:
+                raise ValueError("Invalid frequency format")
+            if len(digits) <= 2:
+                freq_mhz = float(digits)
+            elif len(digits) <= 5:
+                freq_mhz = float(f"{digits[:2]}.{digits[2:]}")
+            else:
+                # Treat as 10 Hz resolution, e.g. 1407400 -> 14.07400 MHz
+                freq_mhz = int(digits) / 100000.0
+        else:
+            raise ValueError("Invalid frequency type")
+
+        if not (1.8 <= freq_mhz <= 30.0):
+            raise ValueError("Frequency must be between 1.8 and 30.0 MHz")
+
+        freq_10hz = int(round(freq_mhz * 100000))
+        freq_str = f"{freq_10hz:07d}"
+        if len(freq_str) == 6:
+            return f"{freq_str[0]}.{freq_str[1:4]}.{freq_str[4:6]}"
+        return f"{freq_str[0:2]}.{freq_str[2:5]}.{freq_str[5:7]}"
+    
+    def do_OPTIONS(self):
+        """Handle CORS preflight requests"""
+        self._set_headers()
+    
+    def do_GET(self):
+        """Handle GET requests"""
+        parsed_path = urlparse(self.path)
+        path = parsed_path.path
+        
+        if not self.radio_app:
+            return self._send_error_json("Radio app not initialized", 500)
+        
+        # GET /api/status - Full radio status
+        if path == '/api/status':
+            status = {
+                'success': True,
+                'frequency_a': self.radio_app.frequency,
+                'frequency_b': self.radio_app.frequency_vfo_b,
+                'mode_a': self.radio_app.mode,
+                'mode_b': self.radio_app.mode_vfo_b,
+                'active_vfo': self.radio_app.active_vfo,
+                'transmitting': self.radio_app.transmitting,
+                'split_enabled': self.radio_app.split_enabled,
+                'af_gain': self.radio_app.af_gain,
+                'sub_af_gain': self.radio_app.sub_af_gain,
+                'rf_gain': self.radio_app.rf_gain,
+                'power_level': self.radio_app.power_level,
+                'shift': self.radio_app.shift,
+                'width': self.radio_app.width,
+                'notch': self.radio_app.notch,
+                'antenna': self.radio_app.antenna,
+                'tuner_active': self.radio_app.tuner_active,
+                'meter_level': self.radio_app.meter_level,
+                'mock_mode': MOCK_MODE,
+                'selected_memory': self.radio_app.selected_memory,
+            }
+            return self._send_json(status)
+        
+        # GET /api/frequency - Current frequency (active VFO)
+        elif path == '/api/frequency':
+            freq = self.radio_app.frequency if self.radio_app.active_vfo == "A" else self.radio_app.frequency_vfo_b
+            return self._send_json({'success': True, 'frequency': freq})
+        
+        # GET /api/mode - Current mode (active VFO)
+        elif path == '/api/mode':
+            mode = self.radio_app.mode if self.radio_app.active_vfo == "A" else self.radio_app.mode_vfo_b
+            return self._send_json({'success': True, 'mode': mode})
+        
+        # GET /api/vfo - Active VFO
+        elif path == '/api/vfo':
+            return self._send_json({'success': True, 'active_vfo': self.radio_app.active_vfo})
+        
+        # GET /api/split - Split mode status
+        elif path == '/api/split':
+            return self._send_json({'success': True, 'split_enabled': self.radio_app.split_enabled})
+        
+        # GET /api/memory/:id - Get memory channel
+        elif path.startswith('/api/memory/'):
+            try:
+                ch = int(path.split('/')[-1])
+                if 0 <= ch < 10:
+                    mem = self.radio_app.memory_channels[ch]
+                    return self._send_json({'success': True, 'channel': ch, 'memory': mem})
+                else:
+                    return self._send_error_json("Channel must be 0-9")
+            except ValueError:
+                return self._send_error_json("Invalid channel number")
+        
+        # GET /api/controls - All control values
+        elif path == '/api/controls':
+            controls = {
+                'success': True,
+                'af_gain': self.radio_app.af_gain,
+                'sub_af_gain': self.radio_app.sub_af_gain,
+                'rf_gain': self.radio_app.rf_gain,
+                'power_level': self.radio_app.power_level,
+                'shift': self.radio_app.shift,
+                'width': self.radio_app.width,
+                'notch': self.radio_app.notch,
+            }
+            return self._send_json(controls)
+        
+        else:
+            return self._send_error_json("Endpoint not found", 404)
+    
+    def do_POST(self):
+        """Handle POST requests"""
+        parsed_path = urlparse(self.path)
+        path = parsed_path.path
+        
+        if not self.radio_app:
+            return self._send_error_json("Radio app not initialized", 500)
+        
+        # Parse JSON body
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length).decode() if content_length > 0 else '{}'
+        
+        try:
+            data = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            return self._send_error_json("Invalid JSON")
+        
+        # POST /api/frequency - Set frequency
+        if path == '/api/frequency':
+            freq = data.get('frequency')
+            vfo = data.get('vfo', self.radio_app.active_vfo)
+            if freq is None:
+                return self._send_error_json("Missing 'frequency' parameter")
+            if vfo not in ["A", "B"]:
+                return self._send_error_json("VFO must be 'A' or 'B'")
+
+            try:
+                normalized_freq = self._normalize_frequency(freq)
+            except ValueError as e:
+                return self._send_error_json(str(e))
+
+            if vfo == "A":
+                self.radio_app.frequency = normalized_freq
+                self.radio_app.set_mode_for_frequency("A")
+                self.radio_app.send_frequency_to_radio("A")
+                self.radio_app.send_mode_to_radio(self.radio_app.mode, "A")
+            else:
+                self.radio_app.frequency_vfo_b = normalized_freq
+                self.radio_app.set_mode_for_frequency("B")
+                self.radio_app.send_frequency_to_radio("B")
+                self.radio_app.send_mode_to_radio(self.radio_app.mode_vfo_b, "B")
+            return self._send_json({'success': True, 'frequency': normalized_freq, 'vfo': vfo})
+        
+        # POST /api/mode - Set mode
+        elif path == '/api/mode':
+            mode = data.get('mode')
+            vfo = data.get('vfo', self.radio_app.active_vfo)
+            valid_modes = ["LSB", "USB", "CW", "AM", "FM"]
+            if mode and mode in valid_modes:
+                if vfo == "A":
+                    self.radio_app.mode = mode
+                    self.radio_app.send_mode_to_radio(mode, "A")
+                else:
+                    self.radio_app.mode_vfo_b = mode
+                    self.radio_app.send_mode_to_radio(mode, "B")
+                return self._send_json({'success': True, 'mode': mode, 'vfo': vfo})
+            else:
+                return self._send_error_json(f"Invalid mode. Must be one of: {valid_modes}")
+        
+        # POST /api/vfo - Switch VFO
+        elif path == '/api/vfo':
+            vfo = data.get('vfo')
+            if vfo in ["A", "B"]:
+                self.radio_app.active_vfo = vfo
+                return self._send_json({'success': True, 'active_vfo': vfo})
+            else:
+                return self._send_error_json("VFO must be 'A' or 'B'")
+        
+        # POST /api/split - Toggle split mode
+        elif path == '/api/split':
+            enable = data.get('enable')
+            if enable is not None:
+                try:
+                    self.radio_app.split_enabled = self._parse_bool(enable)
+                except ValueError:
+                    return self._send_error_json("'enable' must be a boolean")
+            else:
+                self.radio_app.split_enabled = not self.radio_app.split_enabled
+            return self._send_json({'success': True, 'split_enabled': self.radio_app.split_enabled})
+        
+        # POST /api/transmit - Toggle transmit
+        elif path == '/api/transmit':
+            enable = data.get('enable')
+            if enable is not None:
+                try:
+                    self.radio_app.transmitting = self._parse_bool(enable)
+                except ValueError:
+                    return self._send_error_json("'enable' must be a boolean")
+            else:
+                self.radio_app.transmitting = not self.radio_app.transmitting
+            return self._send_json({'success': True, 'transmitting': self.radio_app.transmitting})
+        
+        # POST /api/controls - Set control values
+        elif path == '/api/controls':
+            updated = {}
+            controls = [
+                'af_gain', 'sub_af_gain', 'rf_gain', 'power_level', 'shift', 'width', 'notch'
+            ]
+            try:
+                for control in controls:
+                    if control in data:
+                        value = max(0, min(100, int(data[control])))
+                        setattr(self.radio_app, control, value)
+                        updated[control] = value
+            except (TypeError, ValueError):
+                return self._send_error_json("Control values must be integers between 0 and 100")
+            
+            return self._send_json({'success': True, 'updated': updated})
+        
+        # POST /api/memory/:id - Store to memory
+        elif path.startswith('/api/memory/') and '/store' in path:
+            try:
+                ch = int(path.split('/')[-2])
+                if 0 <= ch < 10:
+                    self.radio_app.store_memory(ch)
+                    return self._send_json({'success': True, 'message': f'Stored to memory {ch}'})
+                else:
+                    return self._send_error_json("Channel must be 0-9")
+            except (ValueError, IndexError):
+                return self._send_error_json("Invalid channel number")
+        
+        else:
+            return self._send_error_json("Endpoint not found", 404)
+    
+    def do_PUT(self):
+        """Handle PUT requests"""
+        parsed_path = urlparse(self.path)
+        path = parsed_path.path
+        
+        if not self.radio_app:
+            return self._send_error_json("Radio app not initialized", 500)
+        
+        # PUT /api/memory/:id - Recall from memory
+        if path.startswith('/api/memory/'):
+            try:
+                ch = int(path.split('/')[-1])
+                if 0 <= ch < 10:
+                    self.radio_app.recall_memory(ch)
+                    return self._send_json({'success': True, 'message': f'Recalled memory {ch}'})
+                else:
+                    return self._send_error_json("Channel must be 0-9")
+            except ValueError:
+                return self._send_error_json("Invalid channel number")
+        
+        else:
+            return self._send_error_json("Endpoint not found", 404)
 
 class HamSimulatorApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
         # Window Setup
-        self.title("WT1W Ham Monitor - Virtual FT-1000MP")
-        self.geometry("1200x480")
+        self.title(WINDOW_TITLE)
+        self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         ctk.set_appearance_mode("Dark")
         self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # Settings file for persistence
+        self.settings_file = Path.home() / ".1k_monitor_settings.json"
+        
+        # Cache for display strings (optimization)
+        self.cached_freq_a = None
+        self.cached_freq_b = None
+        self.cached_mode_a = None
+        self.cached_mode_b = None
+        self.cached_antenna = None
+        self.cached_meter_level = -1
+        self.cached_transmitting = False
+        self.show_help = False
+        
+        # Serial connection tracking
+        self.last_reconnect_attempt = 0
+        self.connection_stable = False
+        
+        # Status message system
+        self.status_message = None
+        self.status_message_until = 0
 
         # Data Variables
         self.frequency = "14.320.00"
@@ -122,11 +447,21 @@ class HamSimulatorApp(ctk.CTk):
         self.vfo_b_last_angle = None  # Track last drag angle for VFO B
         self.serial_port = None  # Serial port for radio communication
         
+        # Memory Channels (10 channels for storing freq + mode pairs)
+        self.memory_channels = [
+            {'freq_a': f'{70.000 + i*0.5:.3f}', 'mode_a': 'USB', 'freq_b': f'{18.000 + i*0.5:.3f}', 'mode_b': 'LSB'}
+            for i in range(10)
+        ]
+        self.selected_memory = 0  # Currently selected memory channel (0-9)
+        
+        # Split Frequency Mode
+        self.split_enabled = False  # When True, TX on VFO A, RX on VFO B
+        
         # Dynamic Elements (Store IDs for updating)
         self.ui_elements = {}
 
         # Canvas Setup (The Radio Face)
-        self.canvas = ctk.CTkCanvas(self, width=1200, height=480, bg=COLOR_CHASSIS, highlightthickness=0)
+        self.canvas = ctk.CTkCanvas(self, width=WINDOW_WIDTH, height=WINDOW_HEIGHT, bg=COLOR_CHASSIS, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
 
         # Drawing Layers
@@ -139,11 +474,37 @@ class HamSimulatorApp(ctk.CTk):
         
         self.init_dynamic_display()
 
+        # Load saved settings
+        self.load_settings()
+        
+        # Bind keyboard controls
+        self.bind("<Up>", lambda e: self.keyboard_frequency_adjust(10))  # +10 kHz
+        self.bind("<Down>", lambda e: self.keyboard_frequency_adjust(-10))  # -10 kHz
+        self.bind("<Shift-Up>", lambda e: self.keyboard_frequency_adjust(1))  # +1 kHz
+        self.bind("<Shift-Down>", lambda e: self.keyboard_frequency_adjust(-1))  # -1 kHz
+        self.bind("<Control-Left>", lambda e: self.switch_vfo())  # Toggle VFO
+        self.bind("<Control-m>", lambda e: self.cycle_mode())  # Cycle mode
+        self.bind("<Control-h>", lambda e: self.toggle_help())  # Toggle help
+        self.bind("<Control-s>", lambda e: self.save_settings())  # Save settings
+        
+        # Memory Channel Bindings (Alt+0 through Alt+9)
+        for i in range(10):
+            self.bind(f"<Alt-Key-{i}>", lambda e, ch=i: self.recall_memory(ch))  # Recall
+            self.bind(f"<Alt-Shift-Key-{i}>", lambda e, ch=i: self.store_memory(ch))  # Store
+        
+        # Split Mode Toggle (Ctrl+')
+        self.bind("<Control-apostrophe>", lambda e: self.toggle_split())
+
         # Start Radio Thread
         self.thread = threading.Thread(target=self.radio_loop, daemon=True)
         self.thread.start()
 
-        # Start Animation Loop
+        # Start HTTP API Server (if enabled)
+        self.api_server = None
+        if HTTP_API_ENABLED:
+            self.start_api_server()
+
+        # Start Animation Loop (100ms = 10 fps - more efficient)
         self.animate()
 
     def draw_chassis(self):
@@ -708,7 +1069,7 @@ class HamSimulatorApp(ctk.CTk):
             # Pad with zeros if needed
             entry = self.freq_entry_buffer.ljust(8, '0')
             
-            # Format as XX.XXX.XX (e.g., 14320000 -> 14.320.00)
+            # Format as XX.XXX.XX (e.g., 14320000 -> 114.320.00)
             formatted = f"{entry[0:2]}.{entry[2:5]}.{entry[5:7]}"
             
             # Remove leading zero if present
@@ -732,30 +1093,12 @@ class HamSimulatorApp(ctk.CTk):
                     # Send to radio
                     self.send_frequency_to_radio("B")
                     self.send_mode_to_radio(self.mode_vfo_b, "B")
+            else:
+                print(f"Frequency {freq_mhz} MHz out of valid range (1.8-30 MHz)")
         except Exception as e:
             print(f"Frequency entry error: {e}")
-
-    def set_mode_for_frequency(self, vfo):
-        """Set appropriate mode based on frequency (LSB below 10 MHz, USB above)"""
-        try:
-            if vfo == "A":
-                freq_str = self.frequency.replace(".", "")
-                # Parse as integer in 10Hz units, convert to MHz
-                freq_mhz = int(freq_str) / 100000.0
-                # Below 10 MHz use LSB, above use USB
-                if freq_mhz < 10.0:
-                    self.mode = "LSB"
-                else:
-                    self.mode = "USB"
-            else:
-                freq_str = self.frequency_vfo_b.replace(".", "")
-                freq_mhz = int(freq_str) / 100000.0
-                if freq_mhz < 10.0:
-                    self.mode_vfo_b = "LSB"
-                else:
-                    self.mode_vfo_b = "USB"
-        except Exception as e:
-            print(f"Mode setting error: {e}")
+            import traceback
+            traceback.print_exc()
 
     def vfo_click(self, vfo):
         """Handle VFO knob click - set as active VFO"""
@@ -831,6 +1174,8 @@ class HamSimulatorApp(ctk.CTk):
             self.serial_port.write(cmd)
         except Exception as e:
             print(f"Error sending frequency to radio: {e}")
+            import traceback
+            traceback.print_exc()
 
     def send_mode_to_radio(self, mode, vfo="A"):
         """Send mode command to radio via serial"""
@@ -847,6 +1192,8 @@ class HamSimulatorApp(ctk.CTk):
             self.serial_port.write(cmd)
         except Exception as e:
             print(f"Error sending mode to radio: {e}")
+            import traceback
+            traceback.print_exc()
 
     def adjust_frequency(self, vfo, delta_khz):
         """Adjust frequency by delta in kHz"""
@@ -974,17 +1321,172 @@ class HamSimulatorApp(ctk.CTk):
             )
             self.swr_meter_segments.append({'id': seg, 'on_color': color})
 
+    def load_settings(self):
+        """Load saved settings from JSON file"""
+        try:
+            if self.settings_file.exists():
+                with open(self.settings_file, 'r') as f:
+                    settings = json.load(f)
+                    self.frequency = settings.get('frequency_a', "14.320.00")
+                    self.frequency_vfo_b = settings.get('frequency_b', "18.120.00")
+                    self.mode = settings.get('mode_a', "USB")
+                    self.mode_vfo_b = settings.get('mode_b', "LSB")
+                    self.af_gain = settings.get('af_gain', 50)
+                    self.sub_af_gain = settings.get('sub_af_gain', 50)
+                    self.rf_gain = settings.get('rf_gain', 80)
+                    self.power_level = settings.get('power_level', 100)
+                    print(f"Loaded settings from {self.settings_file}")
+        except Exception as e:
+            print(f"Error loading settings: {e}")
+
+    def save_settings(self):
+        """Save current settings to JSON file"""
+        try:
+            settings = {
+                'frequency_a': self.frequency,
+                'frequency_b': self.frequency_vfo_b,
+                'mode_a': self.mode,
+                'mode_b': self.mode_vfo_b,
+                'af_gain': self.af_gain,
+                'sub_af_gain': self.sub_af_gain,
+                'rf_gain': self.rf_gain,
+                'power_level': self.power_level,
+            }
+            with open(self.settings_file, 'w') as f:
+                json.dump(settings, f, indent=2)
+            print(f"✓ Settings saved to {self.settings_file}")
+            self.show_status_message("Settings Saved", 2000)
+        except Exception as e:
+            print(f"Error saving settings: {e}")
+    
+    def keyboard_frequency_adjust(self, delta_khz):
+        """Adjust frequency using keyboard (arrow keys)"""
+        if self.freq_entry_mode:
+            return  # Don't adjust if in frequency entry mode
+        self.adjust_frequency(self.active_vfo, delta_khz)
+    
+    def switch_vfo(self):
+        """Toggle between VFO A and B (Ctrl+Left)"""
+        self.active_vfo = "B" if self.active_vfo == "A" else "A"
+    
+    def cycle_mode(self):
+        """Cycle through modes (Ctrl+M)"""
+        modes = ["LSB", "USB", "CW", "AM", "FM"]
+        if self.active_vfo == "A":
+            current_idx = modes.index(self.mode) if self.mode in modes else 0
+            self.mode = modes[(current_idx + 1) % len(modes)]
+            self.send_mode_to_radio(self.mode, "A")
+        else:
+            current_idx = modes.index(self.mode_vfo_b) if self.mode_vfo_b in modes else 0
+            self.mode_vfo_b = modes[(current_idx + 1) % len(modes)]
+            self.send_mode_to_radio(self.mode_vfo_b, "B")
+
+    def store_memory(self, channel):
+        """Store current frequency and mode to memory channel (Alt+Shift+0-9)"""
+        if 0 <= channel < 10:
+            self.memory_channels[channel] = {
+                'freq_a': self.frequency,
+                'mode_a': self.mode,
+                'freq_b': self.frequency_vfo_b,
+                'mode_b': self.mode_vfo_b,
+            }
+            self.selected_memory = channel
+            print(f"Stored current frequencies to memory {channel}")
+            self.show_status_message(f"Memory {channel} Stored", 1500)
+    
+    def recall_memory(self, channel):
+        """Recall frequency and mode from memory channel (Alt+0-9)"""
+        if 0 <= channel < 10:
+            mem = self.memory_channels[channel]
+            self.frequency = mem['freq_a']
+            self.mode = mem['mode_a']
+            self.frequency_vfo_b = mem['freq_b']
+            self.mode_vfo_b = mem['mode_b']
+            self.selected_memory = channel
+            self.send_frequency_to_radio("A")
+            self.send_mode_to_radio(self.mode, "A")
+            print(f"Recalled memory channel {channel}: {self.frequency} {self.mode}")
+            self.show_status_message(f"Memory {channel}: {self.frequency} {self.mode}", 2000)
+
+    def toggle_split(self):
+        """Toggle Split Frequency mode (Ctrl+')"""
+        self.split_enabled = not self.split_enabled
+        if self.split_enabled:
+            print(f"Split mode ON: TX on {self.frequency} / RX on {self.frequency_vfo_b}")
+            self.show_status_message("Split Mode ON", 2000)
+        else:
+            print("Split mode OFF")
+            self.show_status_message("Split Mode OFF", 1500)
+
+    def toggle_help(self):
+        """Toggle help display (Ctrl+H)"""
+        self.show_help = not self.show_help
+
+    def show_status_message(self, message, duration_ms=2000):
+        """Show a temporary status message on screen"""
+        # Store message and timestamp
+        self.status_message = message
+        self.status_message_until = time.time() + (duration_ms / 1000.0)
+
+    def start_api_server(self):
+        """Start the HTTP API server in a background thread"""
+        def run_server():
+            try:
+                # Set the radio app reference for the handler
+                RadioAPIHandler.radio_app = self
+                
+                # Create and start server
+                self.api_server = ThreadingHTTPServer((HTTP_API_HOST, HTTP_API_PORT), RadioAPIHandler)
+                print(f"✓ HTTP API server started on http://{HTTP_API_HOST}:{HTTP_API_PORT}")
+                print(f"  Example: curl http://{HTTP_API_HOST}:{HTTP_API_PORT}/api/status")
+                
+                # Run server (blocks in this thread)
+                self.api_server.serve_forever()
+            except Exception as e:
+                print(f"Error starting HTTP API server: {e}")
+                self.api_server = None
+        
+        # Start in background thread
+        api_thread = threading.Thread(target=run_server, daemon=True)
+        api_thread.start()
+
+    def on_close(self):
+        """Gracefully stop background threads and persist current settings."""
+        self.running = False
+        self.save_settings()
+
+        if self.api_server is not None:
+            try:
+                self.api_server.shutdown()
+                self.api_server.server_close()
+            except Exception as e:
+                print(f"Error stopping HTTP API server: {e}")
+            finally:
+                self.api_server = None
+
+        if self.serial_port is not None:
+            try:
+                self.serial_port.close()
+            except Exception:
+                pass
+            finally:
+                self.serial_port = None
+
+        self.destroy()
+
     def animate(self):
         """Main UI Update Loop"""
         try:
+            # Clear help overlay from previous frame
+            self.canvas.delete("help_overlay")
             self.update_face()
         except Exception as e:
             print(f"UI Error: {e}")
         
-        self.after(50, self.animate)
+        self.after(ANIMATION_LOOP_MS, self.animate)
 
     def update_face(self):
-        # 1. Update Frequency A
+        # 1. Update Frequency A (with caching for optimization)
         freq_a_color = COLOR_DISPLAY_RED if (self.transmitting and self.active_vfo == "A") else COLOR_DISPLAY_ON
         if self.active_vfo != "A": freq_a_color = "#885500" # Dim if inactive
         
@@ -997,10 +1499,20 @@ class HamSimulatorApp(ctk.CTk):
             if freq_a_display.startswith("_"):
                 freq_a_display = " " + freq_a_display[1:]
         
-        self.canvas.itemconfig(self.ui_elements["freq_a"], text=freq_a_display, fill=freq_a_color)
-        self.canvas.itemconfig(self.ui_elements["mode_a"], text=self.mode)
+        # Only update if changed (optimization)
+        if freq_a_display != self.cached_freq_a:
+            self.canvas.itemconfig(self.ui_elements["freq_a"], text=freq_a_display, fill=freq_a_color)
+            self.cached_freq_a = freq_a_display
+        else:
+            # Still update color in case it changed to/from red
+            self.canvas.itemconfig(self.ui_elements["freq_a"], fill=freq_a_color)
+        
+        # Only update mode if changed
+        if self.mode != self.cached_mode_a:
+            self.canvas.itemconfig(self.ui_elements["mode_a"], text=self.mode)
+            self.cached_mode_a = self.mode
 
-        # 2. Update Frequency B
+        # 2. Update Frequency B (with caching for optimization)
         freq_b_color = COLOR_DISPLAY_RED if (self.transmitting and self.active_vfo == "B") else COLOR_DISPLAY_ON
         if self.active_vfo != "B": freq_b_color = "#885500"
         
@@ -1012,12 +1524,26 @@ class HamSimulatorApp(ctk.CTk):
             if freq_b_display.startswith("_"):
                 freq_b_display = " " + freq_b_display[1:]
         
-        self.canvas.itemconfig(self.ui_elements["freq_b"], text=freq_b_display, fill=freq_b_color)
-        self.canvas.itemconfig(self.ui_elements["mode_b"], text=self.mode_vfo_b)
+        # Only update if changed (optimization)
+        if freq_b_display != self.cached_freq_b:
+            self.canvas.itemconfig(self.ui_elements["freq_b"], text=freq_b_display, fill=freq_b_color)
+            self.cached_freq_b = freq_b_display
+        else:
+            # Still update color in case it changed to/from red
+            self.canvas.itemconfig(self.ui_elements["freq_b"], fill=freq_b_color)
+        
+        # Only update mode if changed
+        if self.mode_vfo_b != self.cached_mode_b:
+            self.canvas.itemconfig(self.ui_elements["mode_b"], text=self.mode_vfo_b)
+            self.cached_mode_b = self.mode_vfo_b
 
-        # 3. Update Antenna Display
+        # 3. Update Antenna Display & Split Indicator (only if changed)
         antenna_text = f"ANT {self.antenna}"
-        self.canvas.itemconfig(self.ui_elements["antenna_display"], text=antenna_text)
+        if self.split_enabled:
+            antenna_text += " | SPLIT"
+        if antenna_text != self.cached_antenna:
+            self.canvas.itemconfig(self.ui_elements["antenna_display"], text=antenna_text)
+            self.cached_antenna = antenna_text
 
         # 3b. Animate VFO A Knob (Rotate Dimple based on frequency)
         try:
@@ -1045,14 +1571,17 @@ class HamSimulatorApp(ctk.CTk):
         except:
             pass
 
-        # 4. Update Meter
+        # 4. Update Meters (only if values change significantly or transmit state changes)
         # S-meter: meter_level is 0-255. Map to 0-25 segments.
         active_segments = int((self.meter_level / 255.0) * 25)
-        for i, seg in enumerate(self.meter_segments):
-            if i < active_segments:
-                self.canvas.itemconfig(seg['id'], fill=seg['on_color'])
-            else:
-                self.canvas.itemconfig(seg['id'], fill="#222222") # Off state
+        if active_segments != self.cached_meter_level or self.transmitting != self.cached_transmitting:
+            for i, seg in enumerate(self.meter_segments):
+                if i < active_segments:
+                    self.canvas.itemconfig(seg['id'], fill=seg['on_color'])
+                else:
+                    self.canvas.itemconfig(seg['id'], fill="#222222") # Off state
+            self.cached_meter_level = active_segments
+            self.cached_transmitting = self.transmitting
         
         # Power Output Meter (shown when transmitting)
         if self.transmitting:
@@ -1248,6 +1777,75 @@ class HamSimulatorApp(ctk.CTk):
                 self.canvas.itemconfig(self.ui_elements["conn_port_text"], text="NOT FOUND", fill="#aaa")
                 self.canvas.itemconfig(self.ui_elements["conn_led"], fill="#ff3333")
                 self.canvas.itemconfig(self.ui_elements["conn_status_text"], text="DISCONNECTED", fill="#ff3333")
+        
+        # 10. Draw Help Overlay (if enabled via Ctrl+H)
+        if self.show_help:
+            # Semi-transparent help overlay
+            self.canvas.create_rectangle(0, 0, 1200, 480, fill="#000000", stipple="gray50", tags="help_overlay")
+            
+            # Help text
+            help_lines = [
+                "KEYBOARD SHORTCUTS",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                "↑ / ↓            : ±10 kHz frequency",
+                "Shift + ↑ / ↓    : ±1 kHz frequency",
+                "Ctrl + Left      : Toggle VFO A/B",
+                "Ctrl + M         : Cycle through modes",
+                "Ctrl + '         : Toggle Split Frequency Mode (TX/RX)",
+                "Ctrl + H         : Toggle this help",
+                "Ctrl + S         : Save settings",
+                "Alt + 0-9        : Recall memory channel 0-9",
+                "Alt + Shift 0-9  : Store current to memory 0-9",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                "Numeric Keypad   : Direct frequency entry",
+                "Click VFO Knobs  : Drag to tune | Click to select",
+                "Click Buttons    : Mode, antenna, tuner controls",
+                f"Memory: {self.selected_memory}  |  Split: {'ON' if self.split_enabled else 'OFF'}",
+            ]
+            
+            help_y = 80
+            for i, line in enumerate(help_lines):
+                # Highlight title and header
+                if i == 0:
+                    color = "#ffff00"  # Yellow for title
+                    font = ("Arial", 14, "bold")
+                elif "━" in line:
+                    color = "#888888"
+                    font = ("Arial", 10)
+                elif "Current Memory" in line:
+                    color = "#00ff00"
+                    font = ("Arial", 10, "bold")
+                else:
+                    color = "#cccccc"
+                    font = ("Arial", 10)
+                
+                self.canvas.create_text(
+                    600, help_y,
+                    text=line, fill=color, font=font, anchor="center",
+                    tags="help_overlay"
+                )
+                help_y += 20
+        
+        # 11. Display temporary status messages (if active)
+        if self.status_message and time.time() < self.status_message_until:
+            self.canvas.delete("status_msg")
+            # Draw status message banner at bottom center
+            self.canvas.create_rectangle(
+                400, 440, 800, 470,
+                fill="#004400", outline="#00ff00", width=2,
+                tags="status_msg"
+            )
+            self.canvas.create_text(
+                600, 455,
+                text=self.status_message,
+                fill="#00ff00", font=("Arial", 12, "bold"),
+                tags="status_msg"
+            )
+        else:
+            # Clear expired messages
+            self.canvas.delete("status_msg")
+            if time.time() >= self.status_message_until:
+                self.status_message = None
 
     def radio_loop(self):
         """Handles serial communication in background"""
@@ -1256,11 +1854,28 @@ class HamSimulatorApp(ctk.CTk):
                 # Auto-detect serial port and baud rate
                 detected_port, detected_baud = autodetect_serial_port()
                 print(f"Attempting to connect to: {detected_port} at {detected_baud} baud")
-                self.serial_port = serial.Serial(detected_port, detected_baud, timeout=0.5)
-                ser = self.serial_port
-                print(f"Successfully connected to {detected_port} at {detected_baud} baud")
+                
+                # Add retry logic for connection
+                max_retries = 3
+                retry_count = 0
+                
+                while retry_count < max_retries:
+                    try:
+                        self.serial_port = serial.Serial(detected_port, detected_baud, timeout=0.5)
+                        ser = self.serial_port
+                        print(f"Successfully connected to {detected_port} at {detected_baud} baud")
+                        break
+                    except Exception as e:
+                        retry_count += 1
+                        print(f"Connection attempt {retry_count}/{max_retries} failed: {e}")
+                        if retry_count < max_retries:
+                            time.sleep(1)  # Wait before retrying
+                        else:
+                            raise e
+                
             except Exception as e:
-                print(f"Error opening serial port: {e}")
+                print(f"Error opening serial port after retries: {e}")
+                self.serial_port = None
                 return
 
         while self.running:
@@ -1287,19 +1902,48 @@ class HamSimulatorApp(ctk.CTk):
 
             except Exception as e:
                 print(f"Serial Error: {e}")
+                self.connection_stable = False
+                # Try to reconnect with exponential backoff
+                current_time = time.time()
+                if current_time - self.last_reconnect_attempt > SERIAL_RETRY_INTERVAL:
+                    self.last_reconnect_attempt = current_time
+                    try:
+                        if self.serial_port:
+                            try:
+                                self.serial_port.close()
+                            except:
+                                pass
+                        # Attempt new connection
+                        detected_port, detected_baud = autodetect_serial_port()
+                        self.serial_port = serial.Serial(detected_port, detected_baud, timeout=SERIAL_TIMEOUT)
+                        ser = self.serial_port
+                        self.connection_stable = True
+                        print(f"Reconnected to {detected_port} at {detected_baud} baud")
+                    except Exception as reconnect_error:
+                        print(f"Reconnection failed: {reconnect_error}")
+                        self.serial_port = None
                 time.sleep(1)
 
     def parse_freq_data(self, data):
-        # ... (Same parsing logic as original) ...
-        freq_str = f"{data[0]:02x}{data[1]:02x}{data[2]:02x}{data[3]:02x}"
-        formatted_freq = f"{freq_str[0:2]}.{freq_str[2:5]}.{freq_str[5:7]}"
-        if formatted_freq.startswith("0"):
-            formatted_freq = formatted_freq[1:]
-        self.frequency = formatted_freq
-        
-        mode_byte = data[4]
-        mode_map = {0x00: "LSB", 0x01: "USB", 0x02: "CW", 0x03: "AM", 0x04: "FM"}
-        self.mode = mode_map.get(mode_byte & 0x07, "DATA")
+        """Parse frequency data from radio"""
+        try:
+            freq_str = f"{data[0]:02x}{data[1]:02x}{data[2]:02x}{data[3]:02x}"
+            formatted_freq = f"{freq_str[0:2]}.{freq_str[2:5]}.{freq_str[5:7]}"
+            if formatted_freq.startswith("0"):
+                formatted_freq = formatted_freq[1:]
+            
+            # Validate frequency range
+            freq_mhz = float(freq_str[0:2] + "." + freq_str[2:])
+            if 1.8 <= freq_mhz <= 30.0:
+                self.frequency = formatted_freq
+            
+            mode_byte = data[4]
+            mode_map = {0x00: "LSB", 0x01: "USB", 0x02: "CW", 0x03: "AM", 0x04: "FM"}
+            self.mode = mode_map.get(mode_byte & 0x07, "DATA")
+        except Exception as e:
+            print(f"Error parsing frequency data: {e}")
+            import traceback
+            traceback.print_exc()
 
     def simulate_radio(self):
         """Enhanced simulation for smooth animation"""
@@ -1338,6 +1982,30 @@ class HamSimulatorApp(ctk.CTk):
         # Smooth meter movement
         self.meter_level += (target_meter - self.meter_level) * 0.2
 
+    def set_mode_for_frequency(self, vfo):
+        """Set appropriate mode based on frequency (LSB below 10 MHz, USB above)"""
+        try:
+            if vfo == "A":
+                freq_str = self.frequency.replace(".", "")
+                # Parse as integer in 10Hz units, convert to MHz
+                freq_mhz = int(freq_str) / 100000.0
+                # Below 10 MHz use LSB, above use USB
+                if freq_mhz < 10.0:
+                    self.mode = "LSB"
+                else:
+                    self.mode = "USB"
+            else:
+                freq_str = self.frequency_vfo_b.replace(".", "")
+                freq_mhz = int(freq_str) / 100000.0
+                if freq_mhz < 10.0:
+                    self.mode_vfo_b = "LSB"
+                else:
+                    self.mode_vfo_b = "USB"
+        except Exception as e:
+            print(f"Mode setting error: {e}")
+
+
+# Main execution
 if __name__ == "__main__":
     app = HamSimulatorApp()
     app.mainloop()
