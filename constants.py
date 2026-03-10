@@ -9,7 +9,7 @@ WINDOW_HEIGHT = 480
 WINDOW_TITLE = "WT1W Ham Monitor - Virtual FT-1000MP"
 
 # Animation & Update Rates
-ANIMATION_LOOP_MS = 100  # milliseconds (10 fps)
+ANIMATION_LOOP_MS = 50   # milliseconds (20 fps) for more responsive meter movement
 RADIO_LOOP_MS = 50       # Serial communication loop
 METER_SMOOTHING = 0.2    # 0.0-1.0: Higher = more responsive
 KNOB_SMOOTHING = 0.3     # For VFO and control knobs

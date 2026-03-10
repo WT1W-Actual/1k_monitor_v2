@@ -14,18 +14,276 @@ from colors import *
 from constants import *
 
 # --- CONFIGURATION ---
-# SERIAL_PORT = 'COM3'  # Windows example
-SERIAL_PORT = '/dev/tty.usbserial-AB01'  # Mac example (can be auto-detected)
+SERIAL_PORT = 'COM3'  # Windows example
+# SERIAL_PORT = '/dev/tty.usbserial-AB01'  # Mac example (can be auto-detected)
 BAUD_RATE = 4800  # Will be auto-detected if radio is found
-MOCK_MODE = True  # Set to False to use real radio
+MOCK_MODE = False  # Set to False to use real radio
+
+# CAT framing (FT-1000MP commonly uses 8N2)
+SERIAL_BYTESIZE = serial.EIGHTBITS
+SERIAL_PARITY = serial.PARITY_NONE
+SERIAL_STOPBITS = serial.STOPBITS_TWO
+SERIAL_PROFILES = [
+    (serial.EIGHTBITS, serial.PARITY_NONE, serial.STOPBITS_TWO, "8N2"),
+    (serial.EIGHTBITS, serial.PARITY_NONE, serial.STOPBITS_ONE, "8N1"),
+]
+CAT_FREQ_LSB_FIRST = True  # Command parameters are sent LSB-first (manual coding examples)
+CAT_DEBUG = False
+CAT_COMMAND_DELAY_S = 0.08   # Conservative default wait after CAT TX before reading
+CAT_FREQ_READ_DELAY_S = 0.08 # Frequency/status reads need a little more settling time
+CAT_METER_READ_DELAY_S = 0.05 # F7 meter replies are short and can be polled faster
+CAT_POLL_INTERVAL_S = 0.05   # Keep the poll loop moving so meters feel live
+CAT_POLL_METER = True
+CAT_READ_OPCODE = 0x03       # Try 0x03 first (read frequency per manual); fall back to 0x00 if no RX
+CAT_USE_STATUS_UPDATE_FOR_FREQ = False  # 0x10 format is radio/firmware specific; disabled until mapped reliably
+CAT_STATUS_UPDATE_PARAM = 0x03  # 0x03 = Main VFO-A & Sub VFO-B Data (32 bytes)
+CAT_SYNC_MODE_FROM_STATUS = True
+CAT_SYNC_ANTENNA_FROM_STATUS = True
 
 # Common baud rates for ham radios
 BAUD_RATES_TO_TRY = [4800, 9600, 19200, 38400, 57600]
 
+
+def resolve_serial_settings():
+    """Return serial settings, preferring explicit config over auto-detection."""
+    configured_port = SERIAL_PORT.strip() if isinstance(SERIAL_PORT, str) else SERIAL_PORT
+    configured_baud = BAUD_RATE
+
+    if configured_port and configured_baud:
+        return configured_port, int(configured_baud), False
+
+    detected_port, detected_baud = autodetect_serial_port()
+    return detected_port, detected_baud, True
+
+
+def build_serial_connection(
+    port_name,
+    baud_rate,
+    timeout_seconds,
+    bytesize=SERIAL_BYTESIZE,
+    parity=SERIAL_PARITY,
+    stopbits=SERIAL_STOPBITS,
+):
+    """Create a serial connection using explicit CAT framing settings."""
+    return serial.Serial(
+        port_name,
+        baud_rate,
+        timeout=timeout_seconds,
+        write_timeout=timeout_seconds,
+        bytesize=bytesize,
+        parity=parity,
+        stopbits=stopbits,
+        xonxoff=False,
+        rtscts=False,
+        dsrdtr=False,
+    )
+
+
+def _hex_bytes(data):
+    return " ".join(f"{b:02X}" for b in data)
+
+
+def cat_debug_log(direction, payload):
+    if CAT_DEBUG:
+        print(f"CAT {direction}: {_hex_bytes(payload)}")
+
+
+def frequency_display_to_10hz(freq_display):
+    """Convert XX.XXX.XX-style display frequency into 10 Hz units."""
+    digits = "".join(ch for ch in str(freq_display) if ch.isdigit())
+    if not digits:
+        return None
+    return int(digits)
+
+
+def frequency_10hz_to_display(freq_10hz):
+    """Convert 10 Hz units to XX.XXX.XX-style display frequency."""
+    freq_str = f"{int(freq_10hz):07d}"
+    if len(freq_str) == 6:
+        return f"{freq_str[0]}.{freq_str[1:4]}.{freq_str[4:6]}"
+    return f"{freq_str[0:2]}.{freq_str[2:5]}.{freq_str[5:7]}"
+
+
+def decode_frequency_candidates_from_cat_bytes(freq_bytes):
+    """Decode FT-1000MP CAT frequency bytes, returning plausible values in 10 Hz units.
+
+    Tries both byte orders and both BCD resolution conventions:
+      - 10 Hz resolution MSB-first  (FT-1000MP standard, e.g. 01 43 20 00 = 14.320 MHz)
+      - 1 Hz  resolution MSB-first  (some Yaesu variants,  e.g. 14 32 00 00 = 14.320 MHz)
+    """
+    if len(freq_bytes) != 4:
+        return []
+
+    def is_valid_bcd(byte_value):
+        return ((byte_value >> 4) & 0x0F) <= 9 and (byte_value & 0x0F) <= 9
+
+    if not all(is_valid_bcd(b) for b in freq_bytes):
+        return []
+
+    # Build candidate digit-strings for forward (MSB-first) and reversed (LSB-first).
+    fwd = "".join(f"{b:02x}" for b in freq_bytes)
+    rev = "".join(f"{b:02x}" for b in reversed(freq_bytes))
+
+    decoded = []
+    for candidate in (fwd, rev):
+        if len(candidate) != 8 or not candidate.isdigit():
+            continue
+        val = int(candidate)
+
+        # Interpret as 10 Hz units (1,432,000 × 10 Hz = 14.32 MHz)
+        if 1.8 <= val / 100000.0 <= 30.0:
+            decoded.append(val)
+
+        # Interpret as 1 Hz units (14,320,000 Hz = 14.32 MHz), convert to 10 Hz units
+        if 1.8 <= val / 1000000.0 <= 30.0:
+            decoded.append(val // 10)
+
+    # Preserve insertion order while removing duplicates.
+    return list(dict.fromkeys(decoded))
+
+
+def decode_status_record_frequency_10hz(record_bytes):
+    """Decode 16-byte Status Update record frequency (bytes 1-4) to 10 Hz units.
+
+    FT-1000MP status records encode frequency as a 32-bit binary value where
+    one count equals 0.625 Hz.
+    """
+    if len(record_bytes) < 5:
+        return None
+
+    raw = int.from_bytes(record_bytes[1:5], byteorder="big", signed=False)
+    freq_hz = raw * 0.625
+    if not (1_800_000 <= freq_hz <= 30_000_000):
+        return None
+    return int(round(freq_hz / 10.0))
+
+
+def decode_status_vfo_pair_10hz(status_data):
+    """Decode VFO-A/VFO-B frequencies from Status Update U=03 (32-byte payload)."""
+    if len(status_data) < 32:
+        return None, None
+
+    vfo_a = decode_status_record_frequency_10hz(status_data[0:16])
+    vfo_b = decode_status_record_frequency_10hz(status_data[16:32])
+    return vfo_a, vfo_b
+
+
+def choose_stable_vfo_assignment(decoded_1, decoded_2, current_a_display, current_b_display):
+    """Assign decoded frequencies to VFO-A/VFO-B with minimum jump from current UI state.
+
+    Some rigs/firmware report current/other order instead of fixed A/B order.
+    This chooser keeps labels stable by selecting the mapping closest to existing A/B values.
+    """
+    if decoded_1 is None:
+        return None, None
+
+    if decoded_2 is None:
+        return decoded_1, None
+
+    cur_a = frequency_display_to_10hz(current_a_display)
+    cur_b = frequency_display_to_10hz(current_b_display)
+    if cur_a is None or cur_b is None:
+        return decoded_1, decoded_2
+
+    direct_cost = abs(decoded_1 - cur_a) + abs(decoded_2 - cur_b)
+    swapped_cost = abs(decoded_2 - cur_a) + abs(decoded_1 - cur_b)
+    if swapped_cost < direct_cost:
+        return decoded_2, decoded_1
+    return decoded_1, decoded_2
+
+
+def decode_status_mode(byte_value):
+    """Decode operating mode from status record mode bits.
+
+    Manual examples represent mode in the low-order trio (e.g. ...010 => CW),
+    with other bits used for flags/dummy values.
+    """
+    mode_code = byte_value & 0x07
+    mode_map = {
+        0b000: "LSB",
+        0b001: "USB",
+        0b010: "CW",
+        0b011: "AM",
+        0b100: "FM",
+    }
+    return mode_map.get(mode_code)
+
+
+def decode_status_antenna(byte_value):
+    """Decode antenna selection from VFO/MEM flags byte.
+
+    ANT SELECT bits are flags representing A/B/RX antenna state.
+    """
+    ant_code = (byte_value >> 2) & 0x03
+    if ant_code == 0b00:
+        return 1
+    if ant_code == 0b01:
+        return 2
+    return None
+
+
+def decode_status_transmitting(byte_value):
+    """Decode RX/TX state from the status flags byte.
+
+    Hamlib's FT-1000MP status definitions map bit 5 (0x20) as RX/TX.
+    """
+    return bool(byte_value & 0x20)
+
+
+def select_frequency_from_stream(stream_bytes, current_freq_display):
+    """Scan a raw CAT byte stream and pick the most plausible frequency."""
+    if len(stream_bytes) < 4:
+        return None
+
+    candidates = []
+    for i in range(0, len(stream_bytes) - 3):
+        window = stream_bytes[i:i + 4]
+        for freq_10hz in decode_frequency_candidates_from_cat_bytes(window):
+            candidates.append(freq_10hz)
+
+    if not candidates:
+        return None
+
+    # Keep order while removing duplicates.
+    candidates = list(dict.fromkeys(candidates))
+    current_10hz = frequency_display_to_10hz(current_freq_display)
+    if current_10hz is None:
+        selected_10hz = candidates[0]
+    else:
+        selected_10hz = min(candidates, key=lambda f: abs(f - current_10hz))
+
+    return frequency_10hz_to_display(selected_10hz)
+
+
+def has_valid_frequency_in_payload(payload, opcode, status_param, current_freq_display):
+    """Validate whether a payload contains a usable frequency for a given query type."""
+    if not payload:
+        return False
+
+    if opcode == 0x10 and status_param == 0x03:
+        vfo_a_10hz, _ = decode_status_vfo_pair_10hz(payload)
+        return vfo_a_10hz is not None
+
+    return select_frequency_from_stream(payload, current_freq_display) is not None
+
+
+def encode_frequency_to_cat_bytes(freq_display, lsb_first=True):
+    """Encode XX.XXX.XX display frequency into 4 packed-BCD CAT bytes."""
+    digits = "".join(ch for ch in str(freq_display) if ch.isdigit())
+    if not digits:
+        raise ValueError("Frequency contains no digits")
+    digits = digits.rjust(7, "0")
+    digits = digits[:7].rjust(8, "0")
+
+    bcd = [int(digits[i:i + 2], 16) for i in range(0, 8, 2)]
+    if lsb_first:
+        bcd.reverse()
+    return bcd
+
 def probe_radio(port_name, baud_rate):
     """Probe a serial port at a specific baud rate to see if an FT-1000MP is connected"""
     try:
-        ser = serial.Serial(port_name, baud_rate, timeout=0.3)
+        ser = build_serial_connection(port_name, baud_rate, timeout_seconds=0.3)
         time.sleep(0.1)  # Give port time to settle
         
         # Send frequency read command (opcode 0x03)
@@ -410,6 +668,10 @@ class HamSimulatorApp(ctk.CTk):
         # Serial connection tracking
         self.last_reconnect_attempt = 0
         self.connection_stable = False
+        self.cat_read_opcode_working = None  # Will be set to 0x03, 0x00, or 0x10 after successful probe
+        self.cat_read_status_param_working = None
+        self.cat_read_enabled = False
+        self.mode_sync_block_until = 0.0
         
         # Status message system
         self.status_message = None
@@ -430,6 +692,9 @@ class HamSimulatorApp(ctk.CTk):
         self.power_level = 100  # 0-100 (transmit power)
         self.power_meter_level = 0  # 0-255 (output power meter)
         self.swr_level = 0  # 0-255 (SWR meter)
+        self.radio_tx_active = False  # Actual TX state inferred from CAT status
+        self.tx_meter_hold_until = 0.0  # Hold PO/SWR briefly across missed reads
+        self.last_tx_meter_update = 0.0
         self.shift = 50  # 0-100 (IF shift)
         self.width = 50  # 0-100 (filter width)
         self.notch = 50  # 0-100 (notch filter)
@@ -446,6 +711,10 @@ class HamSimulatorApp(ctk.CTk):
         self.vfo_a_last_angle = None  # Track last drag angle for VFO A
         self.vfo_b_last_angle = None  # Track last drag angle for VFO B
         self.serial_port = None  # Serial port for radio communication
+        self.serial_lock = threading.Lock()  # Protect serial port from concurrent access
+        self.serial_profile_name = "unknown"
+        self.last_polled_freq = None
+        self.last_polled_freq_hits = 0
         
         # Memory Channels (10 channels for storing freq + mode pairs)
         self.memory_channels = [
@@ -997,6 +1266,7 @@ class HamSimulatorApp(ctk.CTk):
             self.nr_off = True
             for freq in self.nr_filters:
                 self.nr_filters[freq] = False
+            self.send_nr_to_radio(None)
         elif button_id == "contour":
             # Cycle through CONTOUR modes: 0=OFF, 1=Low-Cut, 2=Mid-Cut, 3=High-Cut
             self.contour_mode = (self.contour_mode + 1) % 4
@@ -1008,6 +1278,7 @@ class HamSimulatorApp(ctk.CTk):
                 self.apf_filters[f] = False
             # Then turn on the selected one
             self.apf_filters[freq] = True
+            self.send_apf_to_radio(freq)
         elif button_id.startswith("nr_"):
             # NR filters are mutually exclusive - only one can be active
             freq = int(button_id.split('_')[1])
@@ -1017,21 +1288,33 @@ class HamSimulatorApp(ctk.CTk):
             # Then turn on the selected one
             self.nr_filters[freq] = True
             self.nr_off = False
+            self.send_nr_to_radio(freq)
 
     def button_click(self, button_id):
         """Handle button clicks"""
         if button_id == "ant1":
             self.antenna = 1
+            self.send_antenna_to_radio(1)
         elif button_id == "ant2":
             self.antenna = 2
+            self.send_antenna_to_radio(2)
         elif button_id == "tuner":
             self.tuner_active = not self.tuner_active
+            self.send_tuner_to_radio(self.tuner_active)
         elif button_id == "vfo_switch":
             # Toggle between VFO A and B
             self.active_vfo = "B" if self.active_vfo == "A" else "A"
+            self.send_vfo_select_to_radio(self.active_vfo)
         elif button_id == "xmit":
             # Toggle transmit
             self.transmitting = not self.transmitting
+            if self.transmitting:
+                self.tx_meter_hold_until = time.time() + 0.40
+            else:
+                # Return to RX behavior immediately when the app unkeys the radio.
+                self.radio_tx_active = False
+                self.tx_meter_hold_until = 0.0
+            self.send_ptt_to_radio(self.transmitting)
 
     def mode_button_click(self, mode):
         """Handle mode button clicks"""
@@ -1150,28 +1433,216 @@ class HamSimulatorApp(ctk.CTk):
         else:
             self.vfo_b_last_angle = None
 
+    def cat_write(self, cmd):
+        """Send a CAT command with optional debug logging."""
+        if self.serial_port is None:
+            return
+        with self.serial_lock:
+            self.serial_port.write(cmd)
+        cat_debug_log("TX", cmd)
+
+    def cat_write_read(self, cmd, response_len=0, read_delay_s=None):
+        """Send CAT command and optionally read a fixed-length response."""
+        if self.serial_port is None:
+            return b""
+
+        if read_delay_s is None:
+            read_delay_s = CAT_COMMAND_DELAY_S
+
+        with self.serial_lock:
+            self.serial_port.reset_input_buffer()
+            self.serial_port.write(cmd)
+            cat_debug_log("TX", cmd)
+            time.sleep(read_delay_s)
+            if response_len <= 0:
+                return b""
+            data = self.serial_port.read(response_len)
+        if data:
+            cat_debug_log("RX", data)
+        return data
+
+    def cat_read_frequency(self, opcode=None, status_param=None):
+        """Send a frequency poll and collect the response via blocking read.
+        
+        Try opcode 0x03 (simple read) first; fall back to 0x10 0x02 (Status Update Current Data).
+        Status Update returns 16-byte record with frequency at bytes 0-3.
+        """
+        if self.serial_port is None:
+            return b""
+
+        if opcode is None:
+            opcode = CAT_READ_OPCODE
+
+        # For opcode 0x10 (Status Update), byte 4 is parameter.
+        if opcode == 0x10:
+            param = CAT_STATUS_UPDATE_PARAM if status_param is None else status_param
+            response_len_map = {
+                0x01: 1,
+                0x02: 16,
+                0x03: 32,
+                0x04: 16,
+            }
+            response_len = response_len_map.get(param, 16)
+            cmd_freq = bytearray([0x00, 0x00, 0x00, param, 0x10])
+        else:
+            response_len = 5  # Standard 5-byte frequency response
+            cmd_freq = bytearray([0x00, 0x00, 0x00, 0x00, opcode])
+
+        with self.serial_lock:
+            self.serial_port.reset_input_buffer()
+            self.serial_port.write(cmd_freq)
+            cat_debug_log("TX", cmd_freq)
+            time.sleep(CAT_FREQ_READ_DELAY_S)  # let radio transmit its response
+
+            # Blocking read: accumulate bytes within the deadline.
+            data = b""
+            deadline = time.time() + 1.5
+            while len(data) < response_len and time.time() < deadline:
+                chunk = self.serial_port.read(response_len - len(data))
+                if chunk:
+                    data += chunk
+
+        if data:
+            if opcode == 0x10:
+                cat_debug_log(f"RX (opcode 0x{opcode:02x}, param 0x{param:02x})", data)
+            else:
+                cat_debug_log(f"RX (opcode 0x{opcode:02x})", data)
+            
+            # DEBUG: Show raw byte analysis for opcode 0x10
+            if CAT_DEBUG and opcode == 0x10 and len(data) >= 4:
+                print(f"  [DEBUG] Status Update raw bytes[0:4]: {data[0]:02X} {data[1]:02X} {data[2]:02X} {data[3]:02X}")
+                print(f"  [DEBUG] Trying to match expected 18.170.22 MHz = BCD: 01 81 70 22")
+                # Try interpreting bytes at different positions
+                for i in range(max(0, len(data)-4)):
+                    test_bytes = data[i:i+4]
+                    if len(test_bytes) == 4:
+                        # Check if valid BCD
+                        valid_bcd = all(((b >> 4) & 0x0F) <= 9 and (b & 0x0F) <= 9 for b in test_bytes)
+                        if valid_bcd:
+                            bcd_str = "".join(f"{b:02x}" for b in test_bytes)
+                            freq_10hz = int(bcd_str)
+                            freq_mhz = freq_10hz / 100000.0
+                            print(f"  [DEBUG]   Bytes[{i}:{i+4}]: {' '.join(f'{b:02X}' for b in test_bytes)} → {freq_mhz:.5f} MHz")
+        
+        return data
+
+
+    def connect_serial_with_profile(self, port_name, baud_rate, timeout_seconds=0.5):
+        """Try known serial framing profiles and keep the first that yields CAT data."""
+        last_error = None
+
+        for bytesize, parity, stopbits, profile_name in SERIAL_PROFILES:
+            try:
+                candidate = build_serial_connection(
+                    port_name,
+                    baud_rate,
+                    timeout_seconds=timeout_seconds,
+                    bytesize=bytesize,
+                    parity=parity,
+                    stopbits=stopbits,
+                )
+                self.serial_port = candidate
+                self.serial_profile_name = profile_name
+                print(f"Trying serial profile {profile_name}...")
+
+                # Probe known direct frequency read opcodes and status-update variants.
+                probe_succeeded = False
+                probe_targets = [
+                    (0x03, None),
+                    (0x00, None),
+                    (0x10, 0x03),  # VFO-A/VFO-B 32-byte data per manual
+                    (0x10, 0x02),  # Current operating data 16-byte record
+                ]
+                for opcode, status_param in probe_targets:
+                    probe = self.cat_read_frequency(opcode=opcode, status_param=status_param)
+                    if not probe:
+                        if opcode == 0x10:
+                            print(
+                                f"CAT probe: 0 bytes with opcode 0x{opcode:02X}/0x{status_param:02X} "
+                                f"on {profile_name}"
+                            )
+                        else:
+                            print(f"CAT probe: 0 bytes with opcode 0x{opcode:02X} on {profile_name}")
+                        continue
+
+                    if has_valid_frequency_in_payload(probe, opcode, status_param, self.frequency):
+                        self.cat_read_opcode_working = opcode
+                        self.cat_read_status_param_working = status_param
+                        self.cat_read_enabled = True
+                        if opcode == 0x10:
+                            print(
+                                f"CAT probe succeeded with profile {profile_name} using "
+                                f"opcode 0x{opcode:02X}/0x{status_param:02X}"
+                            )
+                        else:
+                            print(
+                                f"CAT probe succeeded with profile {profile_name} using "
+                                f"opcode 0x{opcode:02X}"
+                            )
+                        probe_succeeded = True
+                        break
+
+                    if opcode == 0x10:
+                        print(
+                            f"CAT probe: {len(probe)} bytes with opcode 0x{opcode:02X}/0x{status_param:02X} "
+                            f"on {profile_name} — no valid freq decoded"
+                        )
+                    else:
+                        print(
+                            f"CAT probe: {len(probe)} bytes with opcode 0x{opcode:02X} "
+                            f"on {profile_name} — no valid freq decoded"
+                        )
+
+                if probe_succeeded:
+                    return
+
+                # Optional diagnostic only: check if 0x10 returns data, but do not treat as frequency lock.
+                if CAT_USE_STATUS_UPDATE_FOR_FREQ:
+                    probe = self.cat_read_frequency(opcode=0x10)
+                    if probe:
+                        print(
+                            f"CAT status probe: {len(probe)} bytes with opcode 0x10 on {profile_name} "
+                            f"(not used for frequency lock)"
+                        )
+
+                candidate.close()
+                self.serial_port = None
+            except Exception as e:
+                last_error = e
+                if self.serial_port is not None:
+                    try:
+                        self.serial_port.close()
+                    except Exception:
+                        pass
+                    self.serial_port = None
+
+        # Fallback: keep default profile connected for TX-only operation.
+        if self.serial_port is None:
+            if last_error is not None:
+                print(f"Profile probes failed, falling back to default profile: {last_error}")
+            self.serial_port = build_serial_connection(port_name, baud_rate, timeout_seconds=timeout_seconds)
+            self.serial_profile_name = "default"
+            self.cat_read_opcode_working = None
+            self.cat_read_status_param_working = None
+            self.cat_read_enabled = False
+            print("Connected with default profile (TX-only: CAT readback unavailable)")
+
     def send_frequency_to_radio(self, vfo="A"):
         """Send frequency command to radio via serial"""
         if MOCK_MODE or self.serial_port is None:
             return
         
         try:
-            # Get the frequency to send (only VFO A for FT-1000MP)
+            # Get the frequency to send
             freq_str = self.frequency if vfo == "A" else self.frequency_vfo_b
-            # Convert "14.320.00" to BCD bytes
-            freq_str_clean = freq_str.replace(".", "")
-            # Pad to 8 digits if needed
-            freq_str_clean = freq_str_clean.ljust(8, '0')
-            
-            # Convert to BCD format (e.g., "14320000" -> 0x14, 0x32, 0x00, 0x00)
-            bcd_bytes = []
-            for i in range(0, 8, 2):
-                bcd_byte = int(freq_str_clean[i:i+2], 16)
-                bcd_bytes.append(bcd_byte)
-            
-            # FT-1000MP command: Set frequency (command 0x01)
-            cmd = bytearray([bcd_bytes[0], bcd_bytes[1], bcd_bytes[2], bcd_bytes[3], 0x01])
-            self.serial_port.write(cmd)
+            bcd_bytes = encode_frequency_to_cat_bytes(freq_str, lsb_first=CAT_FREQ_LSB_FIRST)
+
+            # FT-1000MP commands:
+            # - Main VFO-A frequency: 0x0A
+            # - Sub  VFO-B frequency: 0x8A
+            opcode = 0x0A if vfo == "A" else 0x8A
+            cmd = bytearray([bcd_bytes[0], bcd_bytes[1], bcd_bytes[2], bcd_bytes[3], opcode])
+            self.cat_write(cmd)
         except Exception as e:
             print(f"Error sending frequency to radio: {e}")
             import traceback
@@ -1184,16 +1655,151 @@ class HamSimulatorApp(ctk.CTk):
         
         try:
             # Mode map for FT-1000MP
-            mode_map = {"LSB": 0x00, "USB": 0x01, "CW": 0x02, "AM": 0x03, "FM": 0x04}
+            mode_map = {
+                "LSB": 0x00,
+                "USB": 0x01,
+                "CW": 0x02,
+                "AM": 0x04,
+                "FM": 0x06,
+            }
             mode_byte = mode_map.get(mode, 0x01)
-            
-            # FT-1000MP command: Set mode (command 0x07)
-            cmd = bytearray([mode_byte, 0x00, 0x00, 0x00, 0x07])
-            self.serial_port.write(cmd)
+
+            # FT-1000MP command: MODE select (0x0C)
+            cmd = bytearray([0x00, 0x00, 0x00, mode_byte, 0x0C])
+            self.cat_write(cmd)
+            # Avoid immediate bounce from stale status frames right after local writes.
+            self.mode_sync_block_until = time.time() + 1.0
         except Exception as e:
             print(f"Error sending mode to radio: {e}")
             import traceback
             traceback.print_exc()
+
+    def send_nr_to_radio(self, nr_freq):
+        """Send EDSP Noise Reduction setting via opcode 0x4A.
+        P4 0x00 = OFF; 0x01-0x0A = NR levels 1-10.
+        """
+        if MOCK_MODE or self.serial_port is None:
+            return
+
+        try:
+            if nr_freq is None:
+                level = 0x00  # NR OFF
+            else:
+                # Map UI pseudo-frequency labels to NR levels 1-10
+                freq_to_level = {250: 2, 500: 2, 1000: 4, 1500: 6, 2000: 8, 3000: 10}
+                level = freq_to_level.get(nr_freq, 5)
+            cmd = bytearray([0x00, 0x00, 0x00, level, 0x4A])
+            self.cat_write(cmd)
+        except Exception as e:
+            print(f"Error sending NR to radio: {e}")
+
+    def send_apf_to_radio(self, apf_freq):
+        """Send EDSP Audio Peak Filter (APF) command via opcode 0x4C.
+        P4 0x00 = OFF; 0x01+ = ON (center tracks beat note automatically).
+        Note: 0x4B is Audio Notch (DNF); APF is 0x4C per manual ordering.
+        """
+        if MOCK_MODE or self.serial_port is None:
+            return
+
+        try:
+            p1 = 0x01 if apf_freq is not None else 0x00
+            cmd = bytearray([0x00, 0x00, 0x00, p1, 0x4C])
+            self.cat_write(cmd)
+        except Exception as e:
+            print(f"Error sending APF to radio: {e}")
+
+    def send_antenna_to_radio(self, antenna):
+        """Send antenna select via opcode 0x81.
+        P4 encodes antenna in bits 2-3 (matching the status record decode):
+          ANT1 = 0x00 (bits 2-3 = 00), ANT2 = 0x04 (bit 2 set).
+        Tuner state is OR'd in if currently active.
+        """
+        if MOCK_MODE or self.serial_port is None:
+            return
+
+        try:
+            p4 = 0x04 if antenna == 2 else 0x00
+            if self.tuner_active:
+                p4 |= 0x01  # bit 0 = AT-AT tuner engaged
+            self.cat_write(bytearray([0x00, 0x00, 0x00, p4, 0x81]))
+        except Exception as e:
+            print(f"Error sending antenna to radio: {e}")
+
+    def send_tuner_to_radio(self, active):
+        """Toggle the AT-AT antenna tuner via opcode 0x81.
+        Bit 0 in P4 = tuner engaged; antenna selection is preserved.
+        """
+        if MOCK_MODE or self.serial_port is None:
+            return
+
+        try:
+            p4 = 0x04 if self.antenna == 2 else 0x00
+            if active:
+                p4 |= 0x01  # bit 0 = tuner ON
+            self.cat_write(bytearray([0x00, 0x00, 0x00, p4, 0x81]))
+        except Exception as e:
+            print(f"Error sending tuner state to radio: {e}")
+
+    def send_ptt_to_radio(self, transmit):
+        """Key/un-key the transmitter via opcode 0x0F.
+
+        FT-1000MP native CAT uses:
+        - P4 = 0x01, opcode 0x0F -> PTT ON
+        - P4 = 0x00, opcode 0x0F -> PTT OFF
+        """
+        if MOCK_MODE or self.serial_port is None:
+            return
+
+        try:
+            p4 = 0x01 if transmit else 0x00
+            self.cat_write(bytearray([0x00, 0x00, 0x00, p4, 0x0F]))
+        except Exception as e:
+            print(f"Error sending PTT to radio: {e}")
+
+    def send_vfo_select_to_radio(self, vfo):
+        """Select active VFO on radio using opcode 0x05."""
+        if MOCK_MODE or self.serial_port is None:
+            return
+
+        try:
+            v = 0x00 if vfo == "A" else 0x01
+            self.cat_write(bytearray([0x00, 0x00, 0x00, v, 0x05]))
+        except Exception as e:
+            print(f"Error selecting VFO on radio: {e}")
+
+    def read_meter_from_radio(self):
+        """Read main S-meter using opcode F7."""
+        if self.serial_port is None:
+            return None
+
+        try:
+            data = self.cat_write_read(
+                bytearray([0x00, 0x00, 0x00, 0x00, 0xF7]),
+                response_len=5,
+                read_delay_s=CAT_METER_READ_DELAY_S,
+            )
+            if len(data) >= 1:
+                return data[0]
+        except Exception as e:
+            print(f"Error reading meter from radio: {e}")
+        return None
+
+    def read_panel_meter(self, selector):
+        """Read panel/meter value using opcode F7 and selector byte M."""
+        if self.serial_port is None:
+            return None
+
+        try:
+            data = self.cat_write_read(
+                bytearray([0x00, 0x00, 0x00, selector, 0xF7]),
+                response_len=5,
+                read_delay_s=CAT_METER_READ_DELAY_S,
+            )
+            if len(data) >= 1:
+                return data[0]
+        except Exception as e:
+            print(f"Error reading panel selector 0x{selector:02X}: {e}")
+        return None
 
     def adjust_frequency(self, vfo, delta_khz):
         """Adjust frequency by delta in kHz"""
@@ -1253,21 +1859,18 @@ class HamSimulatorApp(ctk.CTk):
         """Creates the text and meter bars that change"""
         
         # === VFO A Display ===
-        # Background "88.888.88" ghost segments for realism
-        self.canvas.create_text(400, 75, text="88.888.88", fill=COLOR_DISPLAY_OFF, font=("Courier", 50, "bold"))
         # Active Text
-        self.ui_elements["freq_a"] = self.canvas.create_text(400, 75, text=self.frequency, fill=COLOR_DISPLAY_ON, font=("Courier", 50, "bold"))
-        self.ui_elements["mode_a"] = self.canvas.create_text(320, 40, text=self.mode, fill="#00ff00", font=("Arial", 12, "bold"))
-        self.canvas.create_text(400, 35, text="VFO A", fill="#cc5500", font=("Arial", 10, "bold"))
+        self.ui_elements["freq_a"] = self.canvas.create_text(640, 75, text=self.frequency, fill=COLOR_DISPLAY_ON, font=("Courier", 48, "bold"), anchor="e")
+        self.ui_elements["mode_a"] = self.canvas.create_text(360, 40, text=self.mode, fill="#00ff00", font=("Arial", 12, "bold"))
+        self.canvas.create_text(640, 35, text="VFO A", fill="#cc5500", font=("Arial", 10, "bold"))
 
-        # === Antenna Display (centered between VFO A and VFO B) ===
-        self.ui_elements["antenna_display"] = self.canvas.create_text(600, 35, text="ANT 1", fill=COLOR_DISPLAY_ON, font=("Arial", 12, "bold"))
+        # === Antenna Display (placed right-of-center, clear of VFO A/B labels) ===
+        self.ui_elements["antenna_display"] = self.canvas.create_text(780, 35, text="ANT 1", fill=COLOR_DISPLAY_ON, font=("Arial", 10, "bold"))
 
         # === VFO B Display ===
-        self.canvas.create_text(800, 75, text="88.888.88", fill=COLOR_DISPLAY_OFF, font=("Courier", 50, "bold"))
-        self.ui_elements["freq_b"] = self.canvas.create_text(800, 75, text=self.frequency_vfo_b, fill=COLOR_DISPLAY_ON, font=("Courier", 50, "bold"))
-        self.ui_elements["mode_b"] = self.canvas.create_text(880, 40, text=self.mode_vfo_b, fill="#00ff00", font=("Arial", 12, "bold"))
-        self.canvas.create_text(800, 35, text="VFO B", fill="#cc5500", font=("Arial", 10, "bold"))
+        self.ui_elements["freq_b"] = self.canvas.create_text(1120, 75, text=self.frequency_vfo_b, fill=COLOR_DISPLAY_ON, font=("Courier", 48, "bold"), anchor="e")
+        self.ui_elements["mode_b"] = self.canvas.create_text(920, 40, text=self.mode_vfo_b, fill="#00ff00", font=("Arial", 12, "bold"))
+        self.canvas.create_text(1120, 35, text="VFO B", fill="#cc5500", font=("Arial", 10, "bold"))
 
         # === Meters ===
         # Labels for all meters - positioned on left side
@@ -1368,6 +1971,7 @@ class HamSimulatorApp(ctk.CTk):
     def switch_vfo(self):
         """Toggle between VFO A and B (Ctrl+Left)"""
         self.active_vfo = "B" if self.active_vfo == "A" else "A"
+        self.send_vfo_select_to_radio(self.active_vfo)
     
     def cycle_mode(self):
         """Cycle through modes (Ctrl+M)"""
@@ -1583,24 +2187,16 @@ class HamSimulatorApp(ctk.CTk):
             self.cached_meter_level = active_segments
             self.cached_transmitting = self.transmitting
         
-        # Power Output Meter (shown when transmitting)
-        if self.transmitting:
-            active_power_segments = int((self.power_meter_level / 255.0) * 25)
-        else:
-            active_power_segments = 0
-        
+        # Power Output Meter — always show polled value (radio returns 0 on RX)
+        active_power_segments = int((self.power_meter_level / 255.0) * 25)
         for i, seg in enumerate(self.power_meter_segments):
             if i < active_power_segments:
                 self.canvas.itemconfig(seg['id'], fill=seg['on_color'])
             else:
                 self.canvas.itemconfig(seg['id'], fill="#222222")
-        
-        # SWR Meter (shown when transmitting)
-        if self.transmitting:
-            active_swr_segments = int((self.swr_level / 255.0) * 25)
-        else:
-            active_swr_segments = 0
-        
+
+        # SWR Meter — always show polled value (radio returns 0 on RX)
+        active_swr_segments = int((self.swr_level / 255.0) * 25)
         for i, seg in enumerate(self.swr_meter_segments):
             if i < active_swr_segments:
                 self.canvas.itemconfig(seg['id'], fill=seg['on_color'])
@@ -1771,7 +2367,13 @@ class HamSimulatorApp(ctk.CTk):
                 port_name = self.serial_port.port if hasattr(self.serial_port, 'port') else "CONNECTED"
                 self.canvas.itemconfig(self.ui_elements["conn_port_text"], text=port_name, fill="#aaa")
                 self.canvas.itemconfig(self.ui_elements["conn_led"], fill="#00ff00")
-                self.canvas.itemconfig(self.ui_elements["conn_status_text"], text="CONNECTED", fill="#00ff00")
+                if self.cat_read_enabled:
+                    status_text = "CONNECTED"
+                    status_color = "#00ff00"
+                else:
+                    status_text = "TX-ONLY"
+                    status_color = "#ffaa00"
+                self.canvas.itemconfig(self.ui_elements["conn_status_text"], text=status_text, fill=status_color)
             else:
                 # Not connected - red
                 self.canvas.itemconfig(self.ui_elements["conn_port_text"], text="NOT FOUND", fill="#aaa")
@@ -1851,9 +2453,12 @@ class HamSimulatorApp(ctk.CTk):
         """Handles serial communication in background"""
         if not MOCK_MODE:
             try:
-                # Auto-detect serial port and baud rate
-                detected_port, detected_baud = autodetect_serial_port()
-                print(f"Attempting to connect to: {detected_port} at {detected_baud} baud")
+                # Use configured SERIAL_PORT/BAUD_RATE when both are set; otherwise auto-detect.
+                detected_port, detected_baud, used_autodetect = resolve_serial_settings()
+                if used_autodetect:
+                    print(f"Attempting auto-detected connection: {detected_port} at {detected_baud} baud")
+                else:
+                    print(f"Attempting configured connection: {detected_port} at {detected_baud} baud")
                 
                 # Add retry logic for connection
                 max_retries = 3
@@ -1861,9 +2466,11 @@ class HamSimulatorApp(ctk.CTk):
                 
                 while retry_count < max_retries:
                     try:
-                        self.serial_port = serial.Serial(detected_port, detected_baud, timeout=0.5)
-                        ser = self.serial_port
-                        print(f"Successfully connected to {detected_port} at {detected_baud} baud")
+                        self.connect_serial_with_profile(detected_port, detected_baud, timeout_seconds=0.5)
+                        print(
+                            f"Successfully connected to {detected_port} at {detected_baud} baud"
+                            f" using profile {self.serial_profile_name}"
+                        )
                         break
                     except Exception as e:
                         retry_count += 1
@@ -1885,20 +2492,74 @@ class HamSimulatorApp(ctk.CTk):
                 continue
 
             try:
-                # Real Radio Logic (Same as before)
-                # 1. Read Frequency
-                cmd_freq = bytearray([0x00, 0x00, 0x00, 0x00, 0x03])
-                ser.write(cmd_freq)
-                data = ser.read(5)
-                if len(data) == 5:
-                    self.parse_freq_data(data)
+                loop_now = time.time()
+                local_tx = self.transmitting
+                effective_tx = (
+                    local_tx
+                    or self.radio_tx_active
+                    or loop_now < self.tx_meter_hold_until
+                )
 
-                # 2. Read Meter
-                cmd_meter = bytearray([0x00, 0x00, 0x00, 0x00, 0x10])
-                ser.write(cmd_meter)
-                meter_byte = ser.read(1)
-                if len(meter_byte) == 1:
-                    self.meter_level = ord(meter_byte)
+                # Poll only when CAT readback has been positively validated.
+                if (
+                    not local_tx
+                    and self.cat_read_enabled
+                    and self.cat_read_opcode_working is not None
+                ):
+                    freq_data = self.cat_read_frequency(
+                        opcode=self.cat_read_opcode_working,
+                        status_param=self.cat_read_status_param_working,
+                    )
+                    if freq_data:
+                        self.parse_freq_data(freq_data)
+
+                # Meter polling
+                if CAT_POLL_METER:
+                    now = loop_now
+
+                    # Prioritize the transmit meters while keyed so they refresh first.
+                    if local_tx:
+                        po_val  = self.read_panel_meter(0x80)   # PO meter
+                        swr_val = self.read_panel_meter(0x85)   # SWR meter
+                        s_val   = None  # Do not poll S-meter during TX
+                        self.meter_level = 0  # Force RX S-meter dark during TX
+                    else:
+                        s_val   = self.read_panel_meter(0x00)   # S-meter
+                        po_val  = self.read_panel_meter(0x80)   # PO meter
+                        swr_val = self.read_panel_meter(0x85)   # SWR meter
+
+                    if s_val is not None:
+                        self.meter_level = s_val
+
+                    if local_tx:
+                        # During TX, latch the most recent valid readings and do not decay.
+                        got_tx_meter = False
+                        if po_val is not None:
+                            self.power_meter_level = po_val
+                            got_tx_meter = True
+                        if swr_val is not None:
+                            self.swr_level = swr_val
+                            got_tx_meter = True
+
+                        if got_tx_meter:
+                            self.last_tx_meter_update = now
+                            self.tx_meter_hold_until = max(self.tx_meter_hold_until, now + 0.25)
+                    else:
+                        # RX mode — accept PO/SWR only if they diverge clearly from the
+                        # concurrent S-meter reading (indicates front-panel TX in progress).
+                        s_ref = s_val if s_val is not None else int(self.meter_level)
+                        if po_val is not None and abs(po_val - s_ref) > 20:
+                            self.power_meter_level = po_val
+                            self.last_tx_meter_update = now
+                        else:
+                            self.power_meter_level = max(0, self.power_meter_level - 2)
+                        if swr_val is not None and abs(swr_val - s_ref) > 20:
+                            self.swr_level = swr_val
+                            self.last_tx_meter_update = now
+                        else:
+                            self.swr_level = max(0, self.swr_level - 2)
+
+                time.sleep(CAT_POLL_INTERVAL_S)
 
             except Exception as e:
                 print(f"Serial Error: {e}")
@@ -1913,12 +2574,14 @@ class HamSimulatorApp(ctk.CTk):
                                 self.serial_port.close()
                             except:
                                 pass
-                        # Attempt new connection
-                        detected_port, detected_baud = autodetect_serial_port()
-                        self.serial_port = serial.Serial(detected_port, detected_baud, timeout=SERIAL_TIMEOUT)
-                        ser = self.serial_port
+                        # Attempt new connection. Keep using fixed config if explicitly set.
+                        detected_port, detected_baud, _ = resolve_serial_settings()
+                        self.connect_serial_with_profile(detected_port, detected_baud, timeout_seconds=SERIAL_TIMEOUT)
                         self.connection_stable = True
-                        print(f"Reconnected to {detected_port} at {detected_baud} baud")
+                        print(
+                            f"Reconnected to {detected_port} at {detected_baud} baud"
+                            f" using profile {self.serial_profile_name}"
+                        )
                     except Exception as reconnect_error:
                         print(f"Reconnection failed: {reconnect_error}")
                         self.serial_port = None
@@ -1927,19 +2590,83 @@ class HamSimulatorApp(ctk.CTk):
     def parse_freq_data(self, data):
         """Parse frequency data from radio"""
         try:
-            freq_str = f"{data[0]:02x}{data[1]:02x}{data[2]:02x}{data[3]:02x}"
-            formatted_freq = f"{freq_str[0:2]}.{freq_str[2:5]}.{freq_str[5:7]}"
-            if formatted_freq.startswith("0"):
-                formatted_freq = formatted_freq[1:]
-            
-            # Validate frequency range
-            freq_mhz = float(freq_str[0:2] + "." + freq_str[2:])
-            if 1.8 <= freq_mhz <= 30.0:
-                self.frequency = formatted_freq
-            
-            mode_byte = data[4]
-            mode_map = {0x00: "LSB", 0x01: "USB", 0x02: "CW", 0x03: "AM", 0x04: "FM"}
-            self.mode = mode_map.get(mode_byte & 0x07, "DATA")
+            if self.cat_read_opcode_working == 0x10 and self.cat_read_status_param_working == 0x03:
+                decoded_1, decoded_2 = decode_status_vfo_pair_10hz(data)
+                vfo_a_10hz, vfo_b_10hz = choose_stable_vfo_assignment(
+                    decoded_1,
+                    decoded_2,
+                    self.frequency,
+                    self.frequency_vfo_b,
+                )
+                if vfo_a_10hz is None:
+                    return
+
+                selected_freq = frequency_10hz_to_display(vfo_a_10hz)
+                if vfo_b_10hz is not None:
+                    self.frequency_vfo_b = frequency_10hz_to_display(vfo_b_10hz)
+
+                if CAT_SYNC_MODE_FROM_STATUS and time.time() >= self.mode_sync_block_until and len(data) >= 24:
+                    rec_a = data[0:16]
+                    rec_b = data[16:32]
+                    # Keep mode aligned with whichever mapping we chose above.
+                    if vfo_a_10hz == decoded_2 and vfo_b_10hz == decoded_1:
+                        rec_a, rec_b = rec_b, rec_a
+
+                    mode_a = decode_status_mode(rec_a[7])
+                    if mode_a:
+                        self.mode = mode_a
+
+                    mode_b = decode_status_mode(rec_b[7])
+                    if mode_b:
+                        self.mode_vfo_b = mode_b
+
+                if CAT_SYNC_ANTENNA_FROM_STATUS and len(data) >= 24:
+                    rec_a = data[0:16]
+                    rec_b = data[16:32]
+                    if vfo_a_10hz == decoded_2 and vfo_b_10hz == decoded_1:
+                        rec_a, rec_b = rec_b, rec_a
+
+                    # Prefer active VFO record for antenna flags.
+                    ant_source = rec_a if self.active_vfo == "A" else rec_b
+                    ant = decode_status_antenna(ant_source[9])
+                    if ant in (1, 2):
+                        self.antenna = ant
+
+                if len(data) >= 24:
+                    rec_a = data[0:16]
+                    rec_b = data[16:32]
+                    if vfo_a_10hz == decoded_2 and vfo_b_10hz == decoded_1:
+                        rec_a, rec_b = rec_b, rec_a
+
+                    tx_source = rec_a if self.active_vfo == "A" else rec_b
+                    self.radio_tx_active = decode_status_transmitting(tx_source[0])
+                    if self.radio_tx_active:
+                        self.tx_meter_hold_until = time.time() + 0.40
+
+                # Require two consecutive matching reads before updating UI.
+                if selected_freq == self.last_polled_freq:
+                    self.last_polled_freq_hits += 1
+                else:
+                    self.last_polled_freq = selected_freq
+                    self.last_polled_freq_hits = 1
+
+                if self.last_polled_freq_hits >= 2:
+                    self.frequency = selected_freq
+                return
+
+            selected_freq = select_frequency_from_stream(data, self.frequency)
+            if not selected_freq:
+                return
+
+            # Require two consecutive matching reads before updating UI.
+            if selected_freq == self.last_polled_freq:
+                self.last_polled_freq_hits += 1
+            else:
+                self.last_polled_freq = selected_freq
+                self.last_polled_freq_hits = 1
+
+            if self.last_polled_freq_hits >= 2:
+                self.frequency = selected_freq
         except Exception as e:
             print(f"Error parsing frequency data: {e}")
             import traceback
@@ -2008,4 +2735,12 @@ class HamSimulatorApp(ctk.CTk):
 # Main execution
 if __name__ == "__main__":
     app = HamSimulatorApp()
-    app.mainloop()
+    try:
+        app.mainloop()
+    except KeyboardInterrupt:
+        # Graceful shutdown when launched from terminal and interrupted with Ctrl+C.
+        print("\nKeyboard interrupt received, shutting down...")
+        try:
+            app.on_close()
+        except Exception:
+            pass
