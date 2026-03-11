@@ -639,3 +639,303 @@ curl -X POST http://127.0.0.1:8080/api/controls \
 ---
 
 73!
+
+
+---
+
+## New CAT Control Endpoints
+
+The following endpoints provide control over the FT-1000MP Mark V's CAT-controllable features.
+
+### APF (Audio Peak Filter)
+
+#### Get APF Status
+```bash
+GET /api/apf
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "enabled": true,
+  "frequency": 500,
+  "filters": {
+    "250": false,
+    "500": true,
+    "1000": false,
+    "1500": false,
+    "2000": false
+  }
+}
+```
+
+#### Set APF
+```bash
+POST /api/apf
+```
+
+**Request Body Options:**
+```json
+// Option 1: Enable/Disable
+{"enable": false}
+
+// Option 2: Set by frequency
+{"frequency": 500}
+
+// Option 3: Set by level with center frequency
+{"level": 2, "center_freq": 700}
+```
+
+**Parameters:**
+- `enable` - Boolean to turn APF on/off
+- `frequency` - Frequency setting (250, 500, 1000, 1500, 2000)
+- `level` - 0=OFF, 1=60Hz BWF, 2=120Hz BWF, 3=240Hz BWF
+- `center_freq` - Center frequency for CW BWF (default 700 Hz)
+
+---
+
+### NR (Noise Reduction)
+
+#### Get NR Status
+```bash
+GET /api/nr
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "enabled": true,
+  "frequency": 1000,
+  "level": 5,
+  "filters": {
+    "500": false,
+    "1000": true,
+    "1500": false,
+    "2000": false,
+    "3000": false
+  },
+  "nr_off": false
+}
+```
+
+#### Set NR
+```bash
+POST /api/nr
+```
+
+**Request Body Options:**
+```json
+// Option 1: Enable/Disable
+{"enable": false}
+
+// Option 2: Set by level (0-10)
+{"level": 5}
+
+// Option 3: Set by frequency
+{"frequency": 1000}
+```
+
+**Parameters:**
+- `enable` - Boolean to turn NR on/off
+- `level` - Integer 0-10 (0=OFF, 1-10=NR level)
+- `frequency` - Frequency setting (500, 1000, 1500, 2000, 3000)
+
+---
+
+### RF Power
+
+#### Get RF Power Status
+```bash
+GET /api/rf_power
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "power_level_setting": 100,
+  "power_meter": 180,
+  "power_meter_level": 175
+}
+```
+
+**Notes:**
+- `power_level_setting` - Local UI slider value (0-100)
+- `power_meter` - Live reading from radio (when connected)
+- `power_meter_level` - Cached meter value (0-255)
+
+#### Set RF Power (UI only)
+```bash
+POST /api/rf_power
+```
+
+**Request Body:**
+```json
+{"power": 75}
+```
+
+**Note:** The FT-1000MP does not have a CAT command to set RF power. This only updates the local UI state.
+
+---
+
+### AF Gain
+
+#### Get AF Gain
+```bash
+GET /api/af_gain
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "af_gain": 50,
+  "note": "AF Gain is not controllable via CAT on the FT-1000MP. This is local UI state only."
+}
+```
+
+#### Set AF Gain (UI only)
+```bash
+POST /api/af_gain
+```
+
+**Request Body:**
+```json
+{"gain": 75}
+```
+
+**Note:** The FT-1000MP does not have CAT control for AF Gain. This only updates the local UI slider.
+
+---
+
+### Sub AF Gain
+
+#### Get Sub AF Gain
+```bash
+GET /api/sub_af_gain
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "sub_af_gain": 50,
+  "note": "Sub AF Gain is not controllable via CAT on the FT-1000MP. This is local UI state only."
+}
+```
+
+#### Set Sub AF Gain (UI only)
+```bash
+POST /api/sub_af_gain
+```
+
+**Request Body:**
+```json
+{"gain": 60}
+```
+
+**Note:** The FT-1000MP does not have CAT control for Sub AF Gain. This only updates the local UI slider.
+
+---
+
+### Meters
+
+#### Get All Meter Readings
+```bash
+GET /api/meters
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "s_meter": 125,
+  "power_meter": 0,
+  "swr_meter": 0,
+  "live_s_meter": 128,
+  "live_power": 0,
+  "live_swr": 0,
+  "live_alc": 0,
+  "shift": 128,
+  "width": 128,
+  "contour": 0,
+  "nr_level": 5
+}
+```
+
+This endpoint reads multiple values from the radio using CAT F7H commands:
+- `s_meter` - Main S-Meter (M=0x00)
+- `power_meter` - Power Output (M=0x80)
+- `swr_meter` - SWR (M=0x85)
+- `live_alc` - ALC (M=0x81)
+- `shift` - SHIFT knob position (M=0xF3)
+- `width` - WIDTH knob position (M=0xF4)
+- `contour` - EDSP Contour selection (M=0xF5)
+- `nr_level` - EDSP NR selection (M=0xF6)
+
+---
+
+## CAT Command Reference
+
+The FT-1000MP Mark V uses the following CAT opcodes for the new features:
+
+| Feature | Opcode | Description |
+|---------|--------|-------------|
+| EDSP Control | 0x75 | All EDSP functions (NR, APF, filters) |
+| Read Meter | 0xF7 | Read various meters and panel controls |
+
+### EDSP Opcode 0x75 Sub-functions (P2 byte)
+
+| P2 Value | Function |
+|----------|----------|
+| 0x40 | AF Filter Off |
+| 0x41 | AF LPF On (P1 = cutoff/20) |
+| 0x42 | AF HPF On (P1 = cutoff/20) |
+| 0x45 | CW 240 Hz BWF (P1 = center freq BCD) |
+| 0x46 | CW 120 Hz BWF (P1 = center freq BCD) |
+| 0x47 | CW 60 Hz BWF (P1 = center freq BCD) |
+| 0x4A | Random Noise Filter (P1 = 0x00 OFF, 0x1Y ON with level Y) |
+| 0x4B | Audio Notch Filter (P1 = 0x00/0x10) |
+
+### Read Meter 0xF7 Selectors (M byte)
+
+| M Value | Reading |
+|---------|---------|
+| 0x00 | Main S-Meter |
+| 0x01 | Sub S-Meter |
+| 0x80 | PO Meter (Power Output) |
+| 0x81 | ALC Meter |
+| 0x85 | SWR Meter |
+| 0xF3 | SHIFT Setting |
+| 0xF4 | WIDTH Setting |
+| 0xF5 | EDSP Contour Selection |
+| 0xF6 | EDSP NR Selection |
+
+---
+
+## Important Notes
+
+### CAT Limitations on FT-1000MP
+
+The following controls are **NOT** available via CAT and are local UI state only:
+- AF Gain (front panel potentiometer)
+- Sub AF Gain (front panel potentiometer)
+- RF Power setting (front panel control)
+
+For these controls, the API endpoints only update the local UI state and do not send commands to the radio.
+
+### CAT Command Format
+
+All FT-1000MP CAT commands are 5 bytes:
+```
+[P1] [P2] [P3] [P4] [OPCODE]
+```
+
+Where parameters are sent LSB-first (reversed from the manual's documentation order).
+
+---
+
+73!
+
