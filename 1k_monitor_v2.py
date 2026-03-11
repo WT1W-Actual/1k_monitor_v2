@@ -423,6 +423,18 @@ class RadioAPIHandler(BaseHTTPRequestHandler):
         
         # GET /api/status - Full radio status
         if path == '/api/status':
+            # Find active APF/NR filters
+            active_apf = None
+            for freq, enabled in self.radio_app.apf_filters.items():
+                if enabled:
+                    active_apf = freq
+                    break
+            active_nr = None
+            for freq, enabled in self.radio_app.nr_filters.items():
+                if enabled:
+                    active_nr = freq
+                    break
+            
             status = {
                 'success': True,
                 'frequency_a': self.radio_app.frequency,
@@ -442,8 +454,16 @@ class RadioAPIHandler(BaseHTTPRequestHandler):
                 'antenna': self.radio_app.antenna,
                 'tuner_active': self.radio_app.tuner_active,
                 'meter_level': self.radio_app.meter_level,
+                'power_meter_level': self.radio_app.power_meter_level,
+                'swr_level': self.radio_app.swr_level,
                 'mock_mode': MOCK_MODE,
                 'selected_memory': self.radio_app.selected_memory,
+                # APF and NR status
+                'apf_enabled': active_apf is not None,
+                'apf_frequency': active_apf,
+                'nr_enabled': not self.radio_app.nr_off,
+                'nr_frequency': active_nr,
+                'contour_mode': self.radio_app.contour_mode,
             }
             return self._send_json(status)
         
@@ -490,6 +510,90 @@ class RadioAPIHandler(BaseHTTPRequestHandler):
                 'notch': self.radio_app.notch,
             }
             return self._send_json(controls)
+        
+        # GET /api/apf - APF (Audio Peak Filter) status
+        elif path == '/api/apf':
+            # Get active APF filter
+            active_apf = None
+            for freq, enabled in self.radio_app.apf_filters.items():
+                if enabled:
+                    active_apf = freq
+                    break
+            return self._send_json({
+                'success': True,
+                'enabled': active_apf is not None,
+                'frequency': active_apf,
+                'filters': self.radio_app.apf_filters,
+            })
+        
+        # GET /api/nr - NR (Noise Reduction) status
+        elif path == '/api/nr':
+            # Get active NR filter
+            active_nr = None
+            for freq, enabled in self.radio_app.nr_filters.items():
+                if enabled:
+                    active_nr = freq
+                    break
+            # Try to read actual NR level from radio
+            nr_level = None
+            if not MOCK_MODE:
+                nr_level = self.radio_app.read_nr_level_from_radio()
+            return self._send_json({
+                'success': True,
+                'enabled': not self.radio_app.nr_off,
+                'frequency': active_nr,
+                'level': nr_level,
+                'filters': self.radio_app.nr_filters,
+                'nr_off': self.radio_app.nr_off,
+            })
+        
+        # GET /api/rf_power - RF Power status (meter reading)
+        elif path == '/api/rf_power':
+            rf_power = None
+            if not MOCK_MODE:
+                rf_power = self.radio_app.read_rf_power_from_radio()
+            return self._send_json({
+                'success': True,
+                'power_level_setting': self.radio_app.power_level,
+                'power_meter': rf_power,
+                'power_meter_level': self.radio_app.power_meter_level,
+            })
+        
+        # GET /api/af_gain - AF Gain status
+        elif path == '/api/af_gain':
+            return self._send_json({
+                'success': True,
+                'af_gain': self.radio_app.af_gain,
+                'note': 'AF Gain is not controllable via CAT on the FT-1000MP. This is local UI state only.',
+            })
+        
+        # GET /api/sub_af_gain - Sub AF Gain status
+        elif path == '/api/sub_af_gain':
+            return self._send_json({
+                'success': True,
+                'sub_af_gain': self.radio_app.sub_af_gain,
+                'note': 'Sub AF Gain is not controllable via CAT on the FT-1000MP. This is local UI state only.',
+            })
+        
+        # GET /api/meters - All meter readings from radio
+        elif path == '/api/meters':
+            meters = {
+                'success': True,
+                's_meter': self.radio_app.meter_level,
+                'power_meter': self.radio_app.power_meter_level,
+                'swr_meter': self.radio_app.swr_level,
+            }
+            # Try to read live values if connected
+            if not MOCK_MODE and self.radio_app.serial_port:
+                meters['live_s_meter'] = self.radio_app.read_meter_from_radio()
+                meters['live_power'] = self.radio_app.read_rf_power_from_radio()
+                meters['live_swr'] = self.radio_app.read_swr_from_radio()
+                meters['live_alc'] = self.radio_app.read_alc_from_radio()
+                meters['shift'] = self.radio_app.read_shift_from_radio()
+                meters['width'] = self.radio_app.read_width_from_radio()
+                meters['contour'] = self.radio_app.read_contour_from_radio()
+                meters['nr_level'] = self.radio_app.read_nr_level_from_radio()
+            return self._send_json(meters)
         
         else:
             return self._send_error_json("Endpoint not found", 404)
@@ -614,6 +718,150 @@ class RadioAPIHandler(BaseHTTPRequestHandler):
                     return self._send_error_json("Channel must be 0-9")
             except (ValueError, IndexError):
                 return self._send_error_json("Invalid channel number")
+        
+        # POST /api/apf - Set APF (Audio Peak Filter)
+        elif path == '/api/apf':
+            enable = data.get('enable')
+            frequency = data.get('frequency')
+            level = data.get('level')
+            
+            if enable is not None:
+                try:
+                    enable = self._parse_bool(enable)
+                except ValueError:
+                    return self._send_error_json("'enable' must be a boolean")
+                
+                if not enable:
+                    # Turn off all APF filters
+                    for f in self.radio_app.apf_filters:
+                        self.radio_app.apf_filters[f] = False
+                    self.radio_app.send_apf_to_radio(None)
+                    return self._send_json({'success': True, 'apf_enabled': False})
+            
+            if frequency is not None:
+                # Turn on specific APF frequency
+                try:
+                    freq = int(frequency)
+                    # First turn off all APF filters
+                    for f in self.radio_app.apf_filters:
+                        self.radio_app.apf_filters[f] = False
+                    # Turn on the requested one if valid
+                    if freq in self.radio_app.apf_filters:
+                        self.radio_app.apf_filters[freq] = True
+                    self.radio_app.send_apf_to_radio(freq)
+                    return self._send_json({'success': True, 'apf_enabled': True, 'frequency': freq})
+                except (ValueError, TypeError):
+                    return self._send_error_json("Invalid frequency value")
+            
+            if level is not None:
+                # Set APF by level (0=off, 1-3=bandwidth settings)
+                try:
+                    lvl = int(level)
+                    center_freq = int(data.get('center_freq', 700))
+                    self.radio_app.send_apf_level_to_radio(lvl, center_freq)
+                    return self._send_json({'success': True, 'apf_level': lvl, 'center_freq': center_freq})
+                except (ValueError, TypeError):
+                    return self._send_error_json("Invalid level value")
+            
+            return self._send_error_json("Must provide 'enable', 'frequency', or 'level' parameter")
+        
+        # POST /api/nr - Set NR (Noise Reduction)
+        elif path == '/api/nr':
+            enable = data.get('enable')
+            frequency = data.get('frequency')
+            level = data.get('level')
+            
+            if enable is not None:
+                try:
+                    enable = self._parse_bool(enable)
+                except ValueError:
+                    return self._send_error_json("'enable' must be a boolean")
+                
+                if not enable:
+                    # Turn off NR
+                    self.radio_app.nr_off = True
+                    for f in self.radio_app.nr_filters:
+                        self.radio_app.nr_filters[f] = False
+                    self.radio_app.send_nr_to_radio(None)
+                    return self._send_json({'success': True, 'nr_enabled': False})
+            
+            if level is not None:
+                # Set NR level directly (0-10)
+                try:
+                    lvl = int(level)
+                    if lvl < 0 or lvl > 10:
+                        return self._send_error_json("Level must be 0-10")
+                    self.radio_app.send_nr_level_to_radio(lvl)
+                    self.radio_app.nr_off = (lvl == 0)
+                    return self._send_json({'success': True, 'nr_enabled': lvl > 0, 'level': lvl})
+                except (ValueError, TypeError):
+                    return self._send_error_json("Invalid level value")
+            
+            if frequency is not None:
+                # Turn on specific NR frequency
+                try:
+                    freq = int(frequency)
+                    # First turn off all NR filters
+                    for f in self.radio_app.nr_filters:
+                        self.radio_app.nr_filters[f] = False
+                    # Turn on the requested one if valid
+                    if freq in self.radio_app.nr_filters:
+                        self.radio_app.nr_filters[freq] = True
+                    self.radio_app.nr_off = False
+                    self.radio_app.send_nr_to_radio(freq)
+                    return self._send_json({'success': True, 'nr_enabled': True, 'frequency': freq})
+                except (ValueError, TypeError):
+                    return self._send_error_json("Invalid frequency value")
+            
+            return self._send_error_json("Must provide 'enable', 'frequency', or 'level' parameter")
+        
+        # POST /api/af_gain - Set AF Gain (local UI only)
+        elif path == '/api/af_gain':
+            gain = data.get('gain') or data.get('value') or data.get('level')
+            if gain is not None:
+                try:
+                    gain = int(gain)
+                    self.radio_app.set_af_gain(gain)
+                    return self._send_json({
+                        'success': True,
+                        'af_gain': self.radio_app.af_gain,
+                        'note': 'AF Gain is local UI state only - not sent to radio via CAT'
+                    })
+                except (ValueError, TypeError):
+                    return self._send_error_json("Gain must be an integer 0-100")
+            return self._send_error_json("Must provide 'gain', 'value', or 'level' parameter")
+        
+        # POST /api/sub_af_gain - Set Sub AF Gain (local UI only)
+        elif path == '/api/sub_af_gain':
+            gain = data.get('gain') or data.get('value') or data.get('level')
+            if gain is not None:
+                try:
+                    gain = int(gain)
+                    self.radio_app.set_sub_af_gain(gain)
+                    return self._send_json({
+                        'success': True,
+                        'sub_af_gain': self.radio_app.sub_af_gain,
+                        'note': 'Sub AF Gain is local UI state only - not sent to radio via CAT'
+                    })
+                except (ValueError, TypeError):
+                    return self._send_error_json("Gain must be an integer 0-100")
+            return self._send_error_json("Must provide 'gain', 'value', or 'level' parameter")
+        
+        # POST /api/rf_power - Set RF Power level (local UI only)
+        elif path == '/api/rf_power':
+            power = data.get('power') or data.get('value') or data.get('level')
+            if power is not None:
+                try:
+                    power = int(power)
+                    self.radio_app.set_rf_power_level(power)
+                    return self._send_json({
+                        'success': True,
+                        'power_level': self.radio_app.power_level,
+                        'note': 'RF Power setting is local UI state only - FT-1000MP does not have CAT power control'
+                    })
+                except (ValueError, TypeError):
+                    return self._send_error_json("Power must be an integer 0-100")
+            return self._send_error_json("Must provide 'power', 'value', or 'level' parameter")
         
         else:
             return self._send_error_json("Endpoint not found", 404)
@@ -1675,38 +1923,375 @@ class HamSimulatorApp(ctk.CTk):
             traceback.print_exc()
 
     def send_nr_to_radio(self, nr_freq):
-        """Send EDSP Noise Reduction setting via opcode 0x4A.
-        P4 0x00 = OFF; 0x01-0x0A = NR levels 1-10.
+        """Send EDSP Noise Reduction setting via opcode 0x75 with P2=0x4A.
+        
+        FT-1000MP Mark V CAT EDSP command structure:
+        - Opcode: 0x75
+        - P2 (byte 4): 0x4A = Random Noise Filter control
+        - P1 (byte 1): 0x00 = OFF, 0x10-0x1A = ON with levels 0-10
+        
+        Per manual: "Random Noise Filter (4AH) Off/On (P1 = 00H/1YH)"
+        where Y represents the NR level (0-A hex = 0-10 decimal)
         """
         if MOCK_MODE or self.serial_port is None:
             return
 
         try:
             if nr_freq is None:
-                level = 0x00  # NR OFF
+                # NR OFF
+                p1 = 0x00
             else:
                 # Map UI pseudo-frequency labels to NR levels 1-10
-                freq_to_level = {250: 2, 500: 2, 1000: 4, 1500: 6, 2000: 8, 3000: 10}
+                # Level format: 0x10 + level (so level 5 = 0x15)
+                freq_to_level = {250: 2, 500: 3, 1000: 5, 1500: 7, 2000: 9, 3000: 10}
                 level = freq_to_level.get(nr_freq, 5)
-            cmd = bytearray([0x00, 0x00, 0x00, level, 0x4A])
+                p1 = 0x10 + level  # Format: 1YH where Y is level
+            
+            # EDSP command: P1, 00, 00, P2=0x4A, opcode=0x75
+            cmd = bytearray([p1, 0x00, 0x00, 0x4A, 0x75])
             self.cat_write(cmd)
+            if CAT_DEBUG:
+                print(f"[CAT TX] NR command: level={p1:02X}")
         except Exception as e:
             print(f"Error sending NR to radio: {e}")
 
-    def send_apf_to_radio(self, apf_freq):
-        """Send EDSP Audio Peak Filter (APF) command via opcode 0x4C.
-        P4 0x00 = OFF; 0x01+ = ON (center tracks beat note automatically).
-        Note: 0x4B is Audio Notch (DNF); APF is 0x4C per manual ordering.
+    def send_nr_level_to_radio(self, level):
+        """Send NR level directly (0=OFF, 1-10=level).
+        
+        Args:
+            level: Integer 0-10 (0=OFF, 1-10=NR level)
         """
         if MOCK_MODE or self.serial_port is None:
             return
 
         try:
-            p1 = 0x01 if apf_freq is not None else 0x00
-            cmd = bytearray([0x00, 0x00, 0x00, p1, 0x4C])
+            if level <= 0:
+                p1 = 0x00  # NR OFF
+            else:
+                # Clamp to valid range
+                level = max(1, min(10, level))
+                p1 = 0x10 + level  # Format: 1YH where Y is level
+            
+            cmd = bytearray([p1, 0x00, 0x00, 0x4A, 0x75])
             self.cat_write(cmd)
+            if CAT_DEBUG:
+                print(f"[CAT TX] NR level command: level={level}, p1={p1:02X}")
+        except Exception as e:
+            print(f"Error sending NR level to radio: {e}")
+
+    def read_nr_level_from_radio(self):
+        """Read current NR level setting via F7H with M=0xF6.
+        
+        Returns:
+            Integer 0-10 representing NR level (0=OFF), or None on error
+        """
+        if self.serial_port is None:
+            return None
+
+        try:
+            data = self.cat_write_read(
+                bytearray([0x00, 0x00, 0x00, 0xF6, 0xF7]),
+                response_len=5,
+                read_delay_s=CAT_METER_READ_DELAY_S,
+            )
+            if len(data) >= 1:
+                raw_value = data[0]
+                # Convert from radio's internal representation
+                # The exact mapping depends on radio firmware
+                # Typically 0 = OFF, higher values = more NR
+                if raw_value == 0:
+                    return 0
+                # Scale 1-255 to 1-10
+                return max(1, min(10, (raw_value * 10) // 255))
+            return None
+        except Exception as e:
+            print(f"Error reading NR level: {e}")
+            return None
+
+    def send_apf_to_radio(self, apf_freq):
+        """Send EDSP Audio Peak Filter (APF) command.
+        
+        FT-1000MP Mark V APF is controlled via EDSP opcode 0x75.
+        For CW modes, uses BWF (Bandwidth Filter) settings:
+        - P2=0x45: CW 240 Hz BWF
+        - P2=0x46: CW 120 Hz BWF  
+        - P2=0x47: CW 60 Hz BWF
+        P1 contains the center frequency in BCD format.
+        
+        For general AF peak filter, P2=0x4C controls APF on/off.
+        """
+        if MOCK_MODE or self.serial_port is None:
+            return
+
+        try:
+            if apf_freq is None:
+                # APF OFF - use AF Filter Off command
+                cmd = bytearray([0x00, 0x00, 0x00, 0x40, 0x75])
+            else:
+                # Map UI frequencies to appropriate BWF setting
+                # Lower frequencies = narrower filter
+                if apf_freq <= 250:
+                    p2 = 0x47  # 60 Hz BWF (narrowest)
+                    p1 = 0x05  # Center frequency in BCD (500 Hz)
+                elif apf_freq <= 500:
+                    p2 = 0x46  # 120 Hz BWF
+                    p1 = 0x06  # Center frequency 600 Hz
+                elif apf_freq <= 1000:
+                    p2 = 0x45  # 240 Hz BWF
+                    p1 = 0x07  # Center frequency 700 Hz
+                else:
+                    # Wider settings - use AF LPF
+                    p2 = 0x41  # AF LPF On
+                    # P1 = cutoff frequency / 20 (hex)
+                    p1 = min(255, apf_freq // 20)
+                
+                cmd = bytearray([p1, 0x00, 0x00, p2, 0x75])
+            
+            self.cat_write(cmd)
+            if CAT_DEBUG:
+                print(f"[CAT TX] APF command: freq={apf_freq}")
         except Exception as e:
             print(f"Error sending APF to radio: {e}")
+
+    def send_apf_level_to_radio(self, level, center_freq=700):
+        """Send APF with specific level/bandwidth setting.
+        
+        Args:
+            level: 0=OFF, 1=60Hz BWF, 2=120Hz BWF, 3=240Hz BWF
+            center_freq: Center frequency for CW BWF (in Hz, BCD encoded)
+        """
+        if MOCK_MODE or self.serial_port is None:
+            return
+
+        try:
+            if level <= 0:
+                # APF OFF
+                cmd = bytearray([0x00, 0x00, 0x00, 0x40, 0x75])
+            else:
+                # Map level to BWF setting
+                bwf_map = {1: 0x47, 2: 0x46, 3: 0x45}  # 60Hz, 120Hz, 240Hz
+                p2 = bwf_map.get(level, 0x46)
+                # Encode center frequency as BCD (divide by 100 for display value)
+                p1 = (center_freq // 100) & 0xFF
+                cmd = bytearray([p1, 0x00, 0x00, p2, 0x75])
+            
+            self.cat_write(cmd)
+            if CAT_DEBUG:
+                print(f"[CAT TX] APF level command: level={level}, center={center_freq}Hz")
+        except Exception as e:
+            print(f"Error sending APF level to radio: {e}")
+
+    def read_rf_power_from_radio(self):
+        """Read current RF power output level via F7H with M=0x80.
+        
+        Returns:
+            Integer 0-255 representing power output meter level, or None on error
+        """
+        if self.serial_port is None:
+            return None
+
+        try:
+            data = self.cat_write_read(
+                bytearray([0x00, 0x00, 0x00, 0x80, 0xF7]),
+                response_len=5,
+                read_delay_s=CAT_METER_READ_DELAY_S,
+            )
+            if len(data) >= 1:
+                return data[0]
+            return None
+        except Exception as e:
+            print(f"Error reading RF power: {e}")
+            return None
+
+    def read_swr_from_radio(self):
+        """Read current SWR level via F7H with M=0x85.
+        
+        Returns:
+            Integer 0-255 representing SWR meter level, or None on error
+        """
+        if self.serial_port is None:
+            return None
+
+        try:
+            data = self.cat_write_read(
+                bytearray([0x00, 0x00, 0x00, 0x85, 0xF7]),
+                response_len=5,
+                read_delay_s=CAT_METER_READ_DELAY_S,
+            )
+            if len(data) >= 1:
+                return data[0]
+            return None
+        except Exception as e:
+            print(f"Error reading SWR: {e}")
+            return None
+
+    def read_alc_from_radio(self):
+        """Read current ALC level via F7H with M=0x81.
+        
+        Returns:
+            Integer 0-255 representing ALC meter level, or None on error
+        """
+        if self.serial_port is None:
+            return None
+
+        try:
+            data = self.cat_write_read(
+                bytearray([0x00, 0x00, 0x00, 0x81, 0xF7]),
+                response_len=5,
+                read_delay_s=CAT_METER_READ_DELAY_S,
+            )
+            if len(data) >= 1:
+                return data[0]
+            return None
+        except Exception as e:
+            print(f"Error reading ALC: {e}")
+            return None
+
+    def read_shift_from_radio(self):
+        """Read current SHIFT knob position via F7H with M=0xF3.
+        
+        Returns:
+            Integer 0-255 representing SHIFT position, or None on error
+        """
+        if self.serial_port is None:
+            return None
+
+        try:
+            data = self.cat_write_read(
+                bytearray([0x00, 0x00, 0x00, 0xF3, 0xF7]),
+                response_len=5,
+                read_delay_s=CAT_METER_READ_DELAY_S,
+            )
+            if len(data) >= 1:
+                return data[0]
+            return None
+        except Exception as e:
+            print(f"Error reading SHIFT: {e}")
+            return None
+
+    def read_width_from_radio(self):
+        """Read current WIDTH knob position via F7H with M=0xF4.
+        
+        Returns:
+            Integer 0-255 representing WIDTH position, or None on error
+        """
+        if self.serial_port is None:
+            return None
+
+        try:
+            data = self.cat_write_read(
+                bytearray([0x00, 0x00, 0x00, 0xF4, 0xF7]),
+                response_len=5,
+                read_delay_s=CAT_METER_READ_DELAY_S,
+            )
+            if len(data) >= 1:
+                return data[0]
+            return None
+        except Exception as e:
+            print(f"Error reading WIDTH: {e}")
+            return None
+
+    def read_contour_from_radio(self):
+        """Read current EDSP Contour selection via F7H with M=0xF5.
+        
+        Returns:
+            Integer representing contour selection, or None on error
+        """
+        if self.serial_port is None:
+            return None
+
+        try:
+            data = self.cat_write_read(
+                bytearray([0x00, 0x00, 0x00, 0xF5, 0xF7]),
+                response_len=5,
+                read_delay_s=CAT_METER_READ_DELAY_S,
+            )
+            if len(data) >= 1:
+                return data[0]
+            return None
+        except Exception as e:
+            print(f"Error reading Contour: {e}")
+            return None
+
+    def read_sub_smeter_from_radio(self):
+        """Read Sub receiver S-meter via F7H with M=0x01.
+        
+        Returns:
+            Integer 0-255 representing sub S-meter level, or None on error
+        """
+        if self.serial_port is None:
+            return None
+
+        try:
+            data = self.cat_write_read(
+                bytearray([0x00, 0x00, 0x00, 0x01, 0xF7]),
+                response_len=5,
+                read_delay_s=CAT_METER_READ_DELAY_S,
+            )
+            if len(data) >= 1:
+                return data[0]
+            return None
+        except Exception as e:
+            print(f"Error reading Sub S-meter: {e}")
+            return None
+
+    # Note: AF Gain and Sub AF Gain are not controllable via CAT on the FT-1000MP
+    # These are physical front panel potentiometer controls.
+    # The radio does not expose CAT commands to read or set audio gain levels.
+    # The UI sliders for AF/Sub AF gain are local to this application only.
+    
+    def get_af_gain(self):
+        """Get current AF gain setting (local UI state only).
+        
+        Note: The FT-1000MP does not support CAT control of AF gain.
+        This returns the local UI slider value.
+        """
+        return self.af_gain
+    
+    def set_af_gain(self, level):
+        """Set AF gain (local UI state only, 0-100).
+        
+        Note: The FT-1000MP does not support CAT control of AF gain.
+        This only updates the local UI slider value.
+        """
+        self.af_gain = max(0, min(100, int(level)))
+        if CAT_DEBUG:
+            print(f"[UI] AF Gain set to {self.af_gain} (local only - not sent to radio)")
+    
+    def get_sub_af_gain(self):
+        """Get current Sub AF gain setting (local UI state only).
+        
+        Note: The FT-1000MP does not support CAT control of Sub AF gain.
+        This returns the local UI slider value.
+        """
+        return self.sub_af_gain
+    
+    def set_sub_af_gain(self, level):
+        """Set Sub AF gain (local UI state only, 0-100).
+        
+        Note: The FT-1000MP does not support CAT control of Sub AF gain.
+        This only updates the local UI slider value.
+        """
+        self.sub_af_gain = max(0, min(100, int(level)))
+        if CAT_DEBUG:
+            print(f"[UI] Sub AF Gain set to {self.sub_af_gain} (local only - not sent to radio)")
+
+    def get_rf_power_level(self):
+        """Get current RF power level setting (local UI state).
+        
+        Returns the UI slider value. To get actual TX power, use read_rf_power_from_radio().
+        """
+        return self.power_level
+    
+    def set_rf_power_level(self, level):
+        """Set RF power level (local UI state, 0-100).
+        
+        Note: The FT-1000MP does not have a CAT command to set RF power.
+        This updates the local UI and could be used for simulation.
+        """
+        self.power_level = max(0, min(100, int(level)))
+        if CAT_DEBUG:
+            print(f"[UI] RF Power level set to {self.power_level}")
 
     def send_antenna_to_radio(self, antenna):
         """Send antenna select via opcode 0x81.
